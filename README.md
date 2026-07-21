@@ -1,5 +1,32 @@
 # Big Head VPN for Windows
 
+## Native Preview (C++20)
+
+Новая специализированная Windows x64-версия находится в `native/`. Она не
+использует Java и sing-box. Сейчас готовы нативный интерфейс, подписки/группы,
+WinHTTP-загрузка, защищённое DPAPI-хранилище и компактное MsQuic-ядро.
+QUIC/TLS, HTTP/3/QPACK, авторизация Hysteria2 и TCP CONNECT через локальный
+SOCKS5 relay проверены на официальном сервере и реальной подписке. UDP relay и
+системный режим ещё разрабатываются, поэтому Preview пока не меняет маршруты Windows.
+
+Сборка из WSL:
+
+```bash
+./scripts/build-native-windows-wsl.sh
+```
+
+Результат:
+
+```text
+dist/BigHeadVPN-Native/BigHeadVPN.exe
+dist/BigHeadVPN-Native/msquic.dll
+```
+
+LLVM-MinGW используется только при сборке и в приложение не попадает. MsQuic —
+официальная QUIC-библиотека Microsoft; её лицензия кладётся рядом с EXE.
+
+## Java-версия
+
 Java 21/Swing-клиент для Windows с интерфейсом в стиле Discord. Сетевое ядро — проверенная версия `sing-box 1.13.14`.
 
 ## Возможности
