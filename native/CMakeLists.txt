@@ -18,11 +18,13 @@ add_executable(BigHeadVPN WIN32
     src/quic_runtime.cpp
     src/hysteria_client.cpp
     src/socks_server.cpp
+    src/process_filter.cpp
     resources/app.rc
 )
 
 target_include_directories(BigHeadVPN SYSTEM PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../.build-tools/msquic/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../.build-tools/windivert"
 )
 
 target_compile_features(BigHeadVPN PRIVATE cxx_std_20)
@@ -40,13 +42,14 @@ target_link_options(BigHeadVPN PRIVATE
     -Wl,--gc-sections -Wl,--strip-all
 )
 target_link_libraries(BigHeadVPN PRIVATE
-    lsqpack bcrypt comctl32 crypt32 dwmapi shlwapi winhttp ws2_32
+    lsqpack bcrypt comctl32 crypt32 dwmapi iphlpapi shlwapi uxtheme winhttp ws2_32
 )
 
 add_executable(BigHeadVPNProbe
     tests/hysteria_probe.cpp
     src/hysteria_client.cpp
     src/socks_server.cpp
+    src/process_filter.cpp
 )
 target_compile_features(BigHeadVPNProbe PRIVATE cxx_std_20)
 target_compile_definitions(BigHeadVPNProbe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00 BIG_HEAD_VPN_TESTING)
@@ -54,7 +57,8 @@ target_compile_options(BigHeadVPNProbe PRIVATE -Os -Wall -Wextra -Wpedantic)
 target_include_directories(BigHeadVPNProbe SYSTEM PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../.build-tools/msquic/include"
     "${LSQPACK_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../.build-tools/windivert"
 )
 target_include_directories(BigHeadVPNProbe PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_options(BigHeadVPNProbe PRIVATE -municode -static -static-libgcc -static-libstdc++ -Wl,--gc-sections -Wl,--strip-all)
-target_link_libraries(BigHeadVPNProbe PRIVATE lsqpack bcrypt ws2_32)
+target_link_libraries(BigHeadVPNProbe PRIVATE lsqpack bcrypt iphlpapi ws2_32)

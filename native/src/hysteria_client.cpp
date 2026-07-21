@@ -8,6 +8,7 @@
 #include <lsxpack_header.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cctype>
@@ -16,10 +17,29 @@
 #include <mutex>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace {
 using namespace std::chrono_literals;
+
+std::wstring transportError(QUIC_STATUS status) {
+    if (status == QUIC_STATUS_CONNECTION_IDLE)
+        return L"Hysteria2-сервер не ответил за 15 секунд. Выберите другой H2-сервер или проверьте, не блокирует ли сеть QUIC/UDP";
+    if (status == QUIC_STATUS_CONNECTION_TIMEOUT)
+        return L"Истёк тайм-аут подключения к Hysteria2-серверу";
+    if (status == QUIC_STATUS_UNREACHABLE)
+        return L"Hysteria2-сервер недоступен из текущей сети";
+    if (status == QUIC_STATUS_CONNECTION_REFUSED)
+        return L"Hysteria2-сервер отклонил подключение";
+    if (status == QUIC_STATUS_HANDSHAKE_FAILURE || status == QUIC_STATUS_TLS_ERROR)
+        return L"Не удалось согласовать QUIC/TLS с Hysteria2-сервером";
+    if (status == QUIC_STATUS_ALPN_NEG_FAILURE)
+        return L"Сервер не поддерживает требуемый HTTP/3 протокол";
+    wchar_t code[20]{};
+    swprintf(code, std::size(code), L"0x%08lX", static_cast<unsigned long>(status));
+    return L"QUIC/TLS завершил соединение (" + std::wstring(code) + L")";
+}
 
 std::string utf8(const std::wstring& value) {
     if (value.empty()) return {};
@@ -248,6 +268,18 @@ struct HysteriaClient::Impl {
         StreamKind kind{};
         OwnedSend(std::vector<uint8_t> value, StreamKind valueKind) : data(std::move(value)), kind(valueKind) { buffer.Length = static_cast<uint32_t>(data.size()); buffer.Buffer = data.data(); }
     };
+    struct OwnedDatagram {
+        std::vector<uint8_t> data;
+        QUIC_BUFFER buffer{};
+        explicit OwnedDatagram(std::vector<uint8_t> value) : data(std::move(value)) { buffer.Length = static_cast<uint32_t>(data.size()); buffer.Buffer = data.data(); }
+    };
+    struct UdpFragments {
+        uint8_t count{};
+        size_t received{};
+        std::string address;
+        std::vector<std::vector<uint8_t>> parts;
+        std::chrono::steady_clock::time_point updated;
+    };
 
     HMODULE module{};
     const QUIC_API_TABLE* api{};
@@ -272,6 +304,13 @@ struct HysteriaClient::Impl {
     unsigned completedSends{};
     unsigned canceledSends{};
     unsigned canceledSendMask{};
+    std::atomic_uint16_t maxDatagramLength{1200};
+    std::atomic_uint16_t udpPacketId{};
+    std::atomic_bool datagramSendEnabled{};
+    std::atomic_uint64_t udpQueued{}, udpSent{}, udpAcknowledged{}, udpLost{}, udpCanceled{}, udpRawReceived{};
+    std::mutex udpMutex;
+    UdpReceiveHandler udpHandler;
+    std::unordered_map<uint64_t, UdpFragments> udpFragments;
 
     static struct lsqpack_dec_hset_if decoderCallbacks;
 
@@ -354,7 +393,10 @@ struct HysteriaClient::Impl {
     void onConnected() {
         auto request = authRequest(config);
         if (!request) { finish(false, L"Не удалось закодировать HTTP/3 auth-запрос"); return; }
-        if (!openStream(StreamKind::Control, QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL, {0x00, 0x04, 0x04, 0x06, 0x00, 0x33, 0x01}, QUIC_SEND_FLAG_START) ||
+        // Hysteria uses raw QUIC DATAGRAM frames, not RFC 9297 HTTP Datagrams.
+        // Advertising SETTINGS_H3_DATAGRAM makes HTTP/3 consume those frames
+        // before Hysteria's UDP session manager can see them.
+        if (!openStream(StreamKind::Control, QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL, {0x00, 0x04, 0x02, 0x06, 0x00}, QUIC_SEND_FLAG_START) ||
             !(authStream = openStream(StreamKind::Auth, QUIC_STREAM_OPEN_FLAG_NONE, std::move(*request), QUIC_SEND_FLAG_START))) {
             finish(false, L"Не удалось открыть HTTP/3 streams");
         }
@@ -464,8 +506,28 @@ struct HysteriaClient::Impl {
         auto& self = *static_cast<Impl*>(context);
         switch (event->Type) {
         case QUIC_CONNECTION_EVENT_CONNECTED: self.onConnected(); break;
+        case QUIC_CONNECTION_EVENT_DATAGRAM_STATE_CHANGED:
+            self.datagramSendEnabled = event->DATAGRAM_STATE_CHANGED.SendEnabled != FALSE;
+            if (event->DATAGRAM_STATE_CHANGED.SendEnabled && event->DATAGRAM_STATE_CHANGED.MaxSendLength > 64)
+                self.maxDatagramLength = event->DATAGRAM_STATE_CHANGED.MaxSendLength;
+            self.stateChanged.notify_all();
+            break;
+        case QUIC_CONNECTION_EVENT_DATAGRAM_RECEIVED:
+            ++self.udpRawReceived;
+            self.receiveUdp(event->DATAGRAM_RECEIVED.Buffer->Buffer, event->DATAGRAM_RECEIVED.Buffer->Length);
+            break;
+        case QUIC_CONNECTION_EVENT_DATAGRAM_SEND_STATE_CHANGED: {
+            auto state = event->DATAGRAM_SEND_STATE_CHANGED.State;
+            if (state == QUIC_DATAGRAM_SEND_SENT) ++self.udpSent;
+            else if (state == QUIC_DATAGRAM_SEND_ACKNOWLEDGED || state == QUIC_DATAGRAM_SEND_ACKNOWLEDGED_SPURIOUS) ++self.udpAcknowledged;
+            else if (state == QUIC_DATAGRAM_SEND_LOST_DISCARDED) ++self.udpLost;
+            else if (state == QUIC_DATAGRAM_SEND_CANCELED) ++self.udpCanceled;
+            if (QUIC_DATAGRAM_SEND_STATE_IS_FINAL(event->DATAGRAM_SEND_STATE_CHANGED.State))
+                delete static_cast<OwnedDatagram*>(event->DATAGRAM_SEND_STATE_CHANGED.ClientContext);
+            break;
+        }
         case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
-            self.finish(false, L"QUIC/TLS завершил соединение, код " + std::to_wstring(event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status)); break;
+            self.finish(false, transportError(event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status)); break;
         case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER:
             self.peerCloseCode = event->SHUTDOWN_INITIATED_BY_PEER.ErrorCode;
             if (self.peerCloseCode != 0x100) self.finish(false, L"Сервер Hysteria2 закрыл соединение, H3 код " + std::to_wstring(self.peerCloseCode));
@@ -496,6 +558,85 @@ struct HysteriaClient::Impl {
         default: break;
         }
         return QUIC_STATUS_SUCCESS;
+    }
+
+    void receiveUdp(const uint8_t* bytes, size_t length) {
+        if (length < 9) return;
+        uint32_t session = (static_cast<uint32_t>(bytes[0]) << 24U) | (static_cast<uint32_t>(bytes[1]) << 16U) |
+            (static_cast<uint32_t>(bytes[2]) << 8U) | bytes[3];
+        uint16_t packet = static_cast<uint16_t>((bytes[4] << 8U) | bytes[5]);
+        uint8_t fragment = bytes[6], count = bytes[7];
+        std::vector<uint8_t> message(bytes, bytes + length); size_t offset = 8; uint64_t addressLength = 0;
+        if (!count || fragment >= count || !readQuicVarint(message, offset, addressLength) || addressLength > message.size() - offset) return;
+        std::string address(reinterpret_cast<const char*>(message.data() + offset), static_cast<size_t>(addressLength));
+        offset += static_cast<size_t>(addressLength);
+        std::vector<uint8_t> payload(message.begin() + static_cast<std::ptrdiff_t>(offset), message.end());
+        UdpReceiveHandler handler;
+        if (count == 1) {
+            std::lock_guard lock(udpMutex); handler = udpHandler;
+        } else {
+            std::lock_guard lock(udpMutex);
+            auto now = std::chrono::steady_clock::now();
+            if (udpFragments.size() > 256)
+                std::erase_if(udpFragments, [&](const auto& item) { return now - item.second.updated > 10s; });
+            auto& state = udpFragments[(static_cast<uint64_t>(session) << 16U) | packet];
+            if (!state.count) { state.count = count; state.address = address; state.parts.resize(count); }
+            if (state.count != count) { udpFragments.erase((static_cast<uint64_t>(session) << 16U) | packet); return; }
+            state.updated = now;
+            if (state.parts[fragment].empty()) { state.parts[fragment] = std::move(payload); ++state.received; }
+            if (state.received != count) return;
+            payload.clear(); for (auto& part : state.parts) payload.insert(payload.end(), part.begin(), part.end());
+            address = state.address; udpFragments.erase((static_cast<uint64_t>(session) << 16U) | packet); handler = udpHandler;
+        }
+        if (handler) handler(session, address, std::move(payload));
+    }
+
+    bool sendUdp(uint32_t session, const std::string& destination, const uint8_t* data, size_t length, std::wstring& error) {
+        if (!udpEnabled) { error = L"Hysteria2-сервер отключил UDP"; return false; }
+        if (!datagramSendEnabled.load()) {
+            std::unique_lock lock(mutex);
+            stateChanged.wait_for(lock, 2s, [&] { return datagramSendEnabled.load() || shutdownComplete; });
+        }
+        if (!datagramSendEnabled.load()) { error = L"QUIC-сервер не согласовал отправку UDP datagram"; return false; }
+        size_t maxLength = maxDatagramLength.load();
+        std::vector<uint8_t> prefix;
+        prefix.reserve(16 + destination.size());
+        prefix.push_back(static_cast<uint8_t>(session >> 24U)); prefix.push_back(static_cast<uint8_t>(session >> 16U));
+        prefix.push_back(static_cast<uint8_t>(session >> 8U)); prefix.push_back(static_cast<uint8_t>(session));
+        prefix.push_back(0); prefix.push_back(0);
+        prefix.push_back(0); prefix.push_back(1); appendQuicVarint(prefix, destination.size());
+        prefix.insert(prefix.end(), destination.begin(), destination.end());
+        if (maxLength <= prefix.size()) { error = L"QUIC datagram слишком мал"; return false; }
+        size_t chunkSize = maxLength - prefix.size();
+        size_t count = std::max<size_t>(1, (length + chunkSize - 1) / chunkSize);
+        if (count > 255) { error = L"UDP-пакет слишком велик"; return false; }
+        // The reference Hysteria client uses packet ID 0 for an unfragmented
+        // datagram. A non-zero ID only identifies parts during reassembly.
+        uint16_t packet = count == 1 ? 0 : ++udpPacketId;
+        prefix[4] = static_cast<uint8_t>(packet >> 8U); prefix[5] = static_cast<uint8_t>(packet);
+        for (size_t fragment = 0, position = 0; fragment < count; ++fragment) {
+            size_t chunk = std::min(chunkSize, length - position);
+            auto frame = prefix; frame[6] = static_cast<uint8_t>(fragment); frame[7] = static_cast<uint8_t>(count);
+            if (chunk) frame.insert(frame.end(), data + position, data + position + chunk);
+            position += chunk;
+            auto owned = std::make_unique<OwnedDatagram>(std::move(frame));
+            QUIC_STATUS status = api->DatagramSend(connection, &owned->buffer, 1, QUIC_SEND_FLAG_NONE, owned.get());
+            if (QUIC_FAILED(status)) { error = L"Не удалось отправить Hysteria2 UDP datagram"; return false; }
+            ++udpQueued;
+            owned.release();
+        }
+        return true;
+    }
+
+    std::wstring udpDiagnostics() const {
+        return L"enabled=" + std::to_wstring(datagramSendEnabled.load()) +
+            L" max=" + std::to_wstring(maxDatagramLength.load()) +
+            L" queued=" + std::to_wstring(udpQueued.load()) +
+            L" sent=" + std::to_wstring(udpSent.load()) +
+            L" ack=" + std::to_wstring(udpAcknowledged.load()) +
+            L" lost=" + std::to_wstring(udpLost.load()) +
+            L" canceled=" + std::to_wstring(udpCanceled.load()) +
+            L" received=" + std::to_wstring(udpRawReceived.load());
     }
 
     static QUIC_STATUS QUIC_API streamCallback(HQUIC, void* context, QUIC_STREAM_EVENT* event) {
@@ -568,7 +709,7 @@ struct HysteriaClient::Impl {
         module = nullptr;
     }
 
-    bool relayTcp(const std::string& destination, SOCKET socket, std::wstring& error) {
+    bool relayTcp(const std::string& destination, SOCKET socket, std::wstring& error, bool socksReply) {
         std::string padding = randomPadding().substr(0, 64 + (GetTickCount64() % 448));
         std::vector<uint8_t> request;
         appendQuicVarint(request, 0x401);
@@ -586,8 +727,10 @@ struct HysteriaClient::Impl {
             }
             if (stream->tcpFailed) { error = stream->tcpError; return false; }
         }
-        const unsigned char reply[]{5, 0, 0, 1, 0, 0, 0, 0, 0, 0};
-        if (!sendSocketAll(socket, reply, sizeof(reply))) { error = L"Локальное SOCKS5-соединение закрыто"; return false; }
+        if (socksReply) {
+            const unsigned char reply[]{5, 0, 0, 1, 0, 0, 0, 0, 0, 0};
+            if (!sendSocketAll(socket, reply, sizeof(reply))) { error = L"Локальное SOCKS5-соединение закрыто"; return false; }
+        }
         std::vector<uint8_t> pending;
         {
             std::lock_guard lock(stream->tcpMutex);
@@ -632,6 +775,20 @@ void HysteriaClient::stop() {
     if (implementation_) implementation_->stop();
 }
 
-bool HysteriaClient::relayTcp(const std::string& destination, std::uintptr_t socket, std::wstring& error) {
-    return implementation_ && implementation_->relayTcp(destination, static_cast<SOCKET>(socket), error);
+bool HysteriaClient::relayTcp(const std::string& destination, std::uintptr_t socket, std::wstring& error, bool socksReply) {
+    return implementation_ && implementation_->relayTcp(destination, static_cast<SOCKET>(socket), error, socksReply);
+}
+
+bool HysteriaClient::sendUdp(uint32_t sessionId, const std::string& destination, const unsigned char* data, size_t length, std::wstring& error) {
+    return implementation_ && implementation_->sendUdp(sessionId, destination, data, length, error);
+}
+
+void HysteriaClient::setUdpReceiveHandler(UdpReceiveHandler handler) {
+    if (!implementation_) return;
+    std::lock_guard lock(implementation_->udpMutex);
+    implementation_->udpHandler = std::move(handler);
+}
+
+std::wstring HysteriaClient::udpDiagnostics() const {
+    return implementation_ ? implementation_->udpDiagnostics() : L"unavailable";
 }

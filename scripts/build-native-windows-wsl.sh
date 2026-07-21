@@ -18,6 +18,10 @@ LSQPACK_DIR="$TOOLS_DIR/ls-qpack"
 LSQPACK_ARCHIVE="$TOOLS_DIR/ls-qpack-771a794.tar.gz"
 LSQPACK_URL="https://codeload.github.com/litespeedtech/ls-qpack/tar.gz/771a794d7dfcc6132576136f62db3065493d876f"
 LSQPACK_SHA256="fd91d0150a14ec4e5df13ad78843b107d8583cf0ea0981f48b3ac4bc5b59bd75"
+WINDIVERT_DIR="$TOOLS_DIR/windivert"
+WINDIVERT_ARCHIVE="$TOOLS_DIR/WinDivert-2.2.2-A.zip"
+WINDIVERT_URL="https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip"
+WINDIVERT_SHA256="63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15"
 
 command -v cmake >/dev/null || { echo "Не найден cmake."; exit 1; }
 mkdir -p "$TOOLS_DIR"
@@ -52,6 +56,19 @@ if [[ ! -f "$MSQUIC_DIR/bin/msquic.dll" || ! -f "$MSQUIC_DIR/include/msquic.h" ]
   unzip -jo "$MSQUIC_PACKAGE" 'build/native/bin/x64/msquic.dll' 'LICENSE' -d "$MSQUIC_DIR/bin"
 fi
 
+if [[ ! -f "$WINDIVERT_DIR/WinDivert.dll" || ! -f "$WINDIVERT_DIR/WinDivert64.sys" || ! -f "$WINDIVERT_DIR/windivert.h" ]]; then
+  echo "Скачиваю официальный WinDivert 2.2.2..."
+  curl -fL "$WINDIVERT_URL" -o "$WINDIVERT_ARCHIVE"
+  echo "$WINDIVERT_SHA256  $WINDIVERT_ARCHIVE" | sha256sum -c -
+  rm -rf "$WINDIVERT_DIR"
+  mkdir -p "$WINDIVERT_DIR"
+  unzip -jo "$WINDIVERT_ARCHIVE" \
+    'WinDivert-2.2.2-A/include/windivert.h' \
+    'WinDivert-2.2.2-A/x64/WinDivert.dll' \
+    'WinDivert-2.2.2-A/x64/WinDivert64.sys' \
+    'WinDivert-2.2.2-A/LICENSE' -d "$WINDIVERT_DIR"
+fi
+
 cmake -S "$PROJECT_DIR/native" -B "$BUILD_DIR" \
   -DCMAKE_TOOLCHAIN_FILE="$PROJECT_DIR/cmake/toolchains/llvm-mingw-x64.cmake" \
   -DCMAKE_BUILD_TYPE=Release
@@ -62,6 +79,10 @@ mkdir -p "$DIST_DIR"
 cp "$BUILD_DIR/BigHeadVPN.exe" "$DIST_DIR/BigHeadVPN.exe"
 cp "$MSQUIC_DIR/bin/msquic.dll" "$DIST_DIR/msquic.dll"
 cp "$MSQUIC_DIR/bin/LICENSE" "$DIST_DIR/MSQUIC_LICENSE.txt"
+cp "$WINDIVERT_DIR/WinDivert.dll" "$DIST_DIR/WinDivert.dll"
+cp "$WINDIVERT_DIR/WinDivert64.sys" "$DIST_DIR/WinDivert64.sys"
+cp "$WINDIVERT_DIR/LICENSE" "$DIST_DIR/WINDIVERT_LICENSE.txt"
+cp "$PROJECT_DIR/native/resources/MANROPE_OFL.txt" "$DIST_DIR/MANROPE_LICENSE.txt"
 
 echo
 echo "Готово: $DIST_DIR/BigHeadVPN.exe"

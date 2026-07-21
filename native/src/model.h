@@ -22,6 +22,7 @@ struct AppModel {
     std::wstring selectedProfileId;
     std::wstring listenAddress = L"127.0.0.1";
     unsigned short listenPort = 2080;
+    std::vector<std::wstring> filteredProcesses;
 
     bool load();
     bool save() const;
@@ -32,4 +33,3 @@ struct AppModel {
 std::wstring newId();
 std::wstring profileName(const std::wstring& uri);
 bool supportedProfile(const std::wstring& uri);
-

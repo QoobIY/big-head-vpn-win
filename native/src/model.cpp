@@ -147,7 +147,7 @@ std::wstring profileName(const std::wstring& uri) {
 }
 
 bool AppModel::load() {
-    groups.clear(); profiles.clear(); selectedProfileId.clear();
+    groups.clear(); profiles.clear(); selectedProfileId.clear(); filteredProcesses.clear();
     auto file = dataDirectory() / L"settings.dat";
     std::ifstream input(file, std::ios::binary);
     if (!input) return true;
@@ -165,6 +165,7 @@ bool AppModel::load() {
         if (f.size() == 4 && f[0] == "G") groups.push_back({unescape(f[1]), unescape(f[2]), unescape(f[3])});
         else if (f.size() == 5 && f[0] == "P") profiles.push_back({unescape(f[1]), unescape(f[2]), unescape(f[3]), unescape(f[4])});
         else if (f.size() == 2 && f[0] == "S") selectedProfileId = unescape(f[1]);
+        else if (f.size() == 2 && f[0] == "F") filteredProcesses.push_back(unescape(f[1]));
         else if (f.size() == 3 && f[0] == "L") {
             listenAddress = unescape(f[1]);
             unsigned value = 0;
@@ -181,6 +182,7 @@ bool AppModel::save() const {
     for (const auto& profile : profiles) content << "P|" << escape(profile.id) << '|' << escape(profile.groupId) << '|' << escape(profile.name) << '|' << escape(profile.uri) << '\n';
     content << "S|" << escape(selectedProfileId) << '\n';
     content << "L|" << escape(listenAddress) << '|' << listenPort << '\n';
+    for (const auto& process : filteredProcesses) content << "F|" << escape(process) << '\n';
     auto plain = content.str();
     DATA_BLOB in{static_cast<DWORD>(plain.size()), reinterpret_cast<BYTE*>(plain.data())}, out{};
     if (!CryptProtectData(&in, L"Big Head VPN settings", nullptr, nullptr, nullptr,
@@ -218,4 +220,3 @@ void AppModel::deleteGroup(const std::wstring& groupId) {
     profiles.erase(std::remove_if(profiles.begin(), profiles.end(), [&](const auto& item) { return item.groupId == groupId; }), profiles.end());
     if (std::none_of(profiles.begin(), profiles.end(), [&](const auto& item) { return item.id == selectedProfileId; })) selectedProfileId.clear();
 }
-
