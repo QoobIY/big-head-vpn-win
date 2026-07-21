@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $classes = Join-Path $root "build\classes"
+if (Test-Path $classes) { Remove-Item $classes -Recurse -Force }
 New-Item $classes -ItemType Directory -Force | Out-Null
 $sources = Get-ChildItem (Join-Path $root "src\main\java") -Recurse -Filter *.java | ForEach-Object FullName
 javac --release 21 -encoding UTF-8 -d $classes $sources

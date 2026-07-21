@@ -17,24 +17,27 @@ public final class ProfileParser {
             throw new IllegalArgumentException("Поддерживаются vless://, hysteria://, hysteria2:// и hy2://");
         }
     }
-    public static String outbound(Profile profile) {
+    public static String outbound(Profile profile) { return outbound(profile,""); }
+    public static String outbound(Profile profile,String bindInterface) {
         var u=connectionUri(profile.uri()); var q=query(u); var scheme=lower(u.getScheme());
         if (scheme.equals("vless")) {
             String tls=null, transport=null, security=q.getOrDefault("security","");
             if (security.equals("tls") || security.equals("reality")) tls=tls(q,u.getHost(),security.equals("reality"));
             var type=q.getOrDefault("type","tcp");
             if (!type.equals("tcp") && !type.equals("raw")) transport=transport(type,q);
-            return Json.object("type","vless","tag","proxy","server",u.getHost(),"server_port",u.getPort(),"uuid",decode(u.getRawUserInfo()),
+            return Json.object("type","vless","tag","proxy","server",u.getHost(),"server_port",u.getPort(),"uuid",decode(u.getRawUserInfo()),"bind_interface",blankToNull(bindInterface),
                     "flow",blankToNull(q.get("flow")),"tls",tls==null?null:Json.raw(tls),"transport",transport==null?null:Json.raw(transport));
         }
         String obfs=null;
         if (!q.getOrDefault("obfs","").isBlank()) obfs=Json.object("type",q.get("obfs"),"password",q.getOrDefault("obfs-password",q.getOrDefault("obfs_password","")));
-        return Json.object("type","hysteria2","tag","proxy","server",u.getHost(),"server_port",u.getPort(),"password",decode(u.getRawUserInfo()),
+        return Json.object("type","hysteria2","tag","proxy","server",u.getHost(),"server_port",u.getPort(),"password",decode(u.getRawUserInfo()),"bind_interface",blankToNull(bindInterface),
                 "tls",Json.raw(tls(q,u.getHost(),false)),"obfs",obfs==null?null:Json.raw(obfs));
     }
+    static String serverHost(Profile profile){return connectionUri(profile.uri()).getHost();}
     private static String tls(Map<String,String> q,String host,boolean reality) {
         String r=null; if (reality) r=Json.object("enabled",true,"public_key",q.getOrDefault("pbk",""),"short_id",q.getOrDefault("sid",""));
-        return Json.object("enabled",true,"server_name",q.getOrDefault("sni",host),"insecure",q.getOrDefault("insecure",q.getOrDefault("allowInsecure","0")).equals("1"),"reality",r==null?null:Json.raw(r));
+        String utls=null;if(reality)utls=Json.object("enabled",true,"fingerprint",q.getOrDefault("fp","chrome"));
+        return Json.object("enabled",true,"server_name",q.getOrDefault("sni",host),"insecure",q.getOrDefault("insecure",q.getOrDefault("allowInsecure","0")).equals("1"),"utls",utls==null?null:Json.raw(utls),"reality",r==null?null:Json.raw(r));
     }
     private static String transport(String type,Map<String,String> q) { return switch(type) {
         case "ws" -> Json.object("type","ws","path",q.getOrDefault("path","/"),"headers",Json.raw(Json.object("Host",q.getOrDefault("host",""))));

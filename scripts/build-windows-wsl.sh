@@ -42,6 +42,7 @@ if [[ "${1:-}" != "--full" \
   && -d "$PROJECT_DIR/dist/BigHeadVPN/runtime" \
   && -f "$PROJECT_DIR/dist/BigHeadVPN/app/big-head-vpn.jar" ]]; then
   cp "$JAR_FILE" "$PROJECT_DIR/dist/BigHeadVPN/app/big-head-vpn.jar"
+  cp "$PROJECT_DIR/THIRD_PARTY_NOTICES.md" "$PROJECT_DIR/dist/BigHeadVPN/"
   echo
   echo "Быстрая сборка готова: $PROJECT_DIR/dist/BigHeadVPN/BigHeadVPN.exe"
   echo "Для полного пересоздания EXE: ./scripts/build-windows-wsl.sh --full"
@@ -73,25 +74,19 @@ echo "Создаю Windows EXE со встроенной Java..."
   --main-class app.bighead.vpn.Main \
   --icon "C:\\Users\\$WINDOWS_USER\\AppData\\Local\\Temp\\big-head-vpn-wsl-build\\input\\big-head-vpn.ico" \
   --dest "C:\\Users\\$WINDOWS_USER\\AppData\\Local\\Temp\\big-head-vpn-wsl-build\\output" \
-  --app-version 0.1.0 \
+  --app-version 1.0.0 \
   --vendor "Big Head"
 
 mkdir -p "$WINDOWS_STAGE/output/BigHeadVPN/scripts"
 cp "$PROJECT_DIR/scripts/download-sing-box.ps1" "$WINDOWS_STAGE/output/BigHeadVPN/scripts/"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File \
-  "C:\\Users\\$WINDOWS_USER\\AppData\\Local\\Temp\\big-head-vpn-wsl-build\\output\\BigHeadVPN\\scripts\\download-sing-box.ps1"
-
-RCEDIT="$TOOLS_DIR/rcedit.exe"
-if [[ ! -f "$RCEDIT" ]]; then
-  curl -fL "https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe" -o "$RCEDIT"
-  chmod +x "$RCEDIT"
+if [[ -f "$PROJECT_DIR/dist/BigHeadVPN/tools/sing-box.exe" ]]; then
+  mkdir -p "$WINDOWS_STAGE/output/BigHeadVPN/tools"
+  cp -a "$PROJECT_DIR/dist/BigHeadVPN/tools/." "$WINDOWS_STAGE/output/BigHeadVPN/tools/"
+else
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File \
+    "C:\\Users\\$WINDOWS_USER\\AppData\\Local\\Temp\\big-head-vpn-wsl-build\\output\\BigHeadVPN\\scripts\\download-sing-box.ps1"
 fi
-chmod u+w "$WINDOWS_STAGE/output/BigHeadVPN/BigHeadVPN.exe"
-if ! "$RCEDIT" \
-  "C:\\Users\\$WINDOWS_USER\\AppData\\Local\\Temp\\big-head-vpn-wsl-build\\output\\BigHeadVPN\\BigHeadVPN.exe" \
-  --set-requested-execution-level requireAdministrator; then
-  echo "Предупреждение: UAC-манифест не добавлен. Запускайте EXE через 'Запуск от имени администратора'."
-fi
+cp "$PROJECT_DIR/THIRD_PARTY_NOTICES.md" "$WINDOWS_STAGE/output/BigHeadVPN/"
 
 rm -rf "$PROJECT_DIR/dist/BigHeadVPN"
 cp -a "$WINDOWS_STAGE/output/BigHeadVPN" "$PROJECT_DIR/dist/BigHeadVPN"
