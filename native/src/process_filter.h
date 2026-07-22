@@ -4,13 +4,13 @@
 #include <string>
 #include <vector>
 
-class HysteriaClient;
+class TunnelClient;
 
 class ProcessFilter {
 public:
     static std::unique_ptr<ProcessFilter> start(
         std::vector<std::wstring> executableNames,
-        HysteriaClient& client,
+        TunnelClient& client,
         std::wstring& error);
 
     ~ProcessFilter();

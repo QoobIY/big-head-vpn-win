@@ -1,5 +1,5 @@
 #include "process_filter.h"
-#include "hysteria_client.h"
+#include "tunnel_client.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -12,6 +12,7 @@
 #include <atomic>
 #include <filesystem>
 #include <mutex>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -91,6 +92,87 @@ std::wstring processName(DWORD pid) {
     CloseHandle(process);
     return ok ? lower(std::filesystem::path(std::wstring(path, length)).filename().wstring()) : std::wstring{};
 }
+
+bool isNetworkPath(const std::wstring& path) {
+    return path.rfind(LR"(\\)", 0) == 0 || path.rfind(LR"(\\?\UNC\)", 0) == 0;
+}
+
+std::wstring win32Message(DWORD code) {
+    wchar_t* buffer{};
+    DWORD size = FormatMessageW(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr,
+        code,
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        reinterpret_cast<wchar_t*>(&buffer),
+        0,
+        nullptr);
+    if (!size || !buffer) return {};
+    std::wstring message(buffer, size);
+    LocalFree(buffer);
+    while (!message.empty() && (message.back() == L'\r' || message.back() == L'\n' || message.back() == L'.' || message.back() == L' ')) message.pop_back();
+    return message;
+}
+
+bool transientWinDivertDriverError(DWORD code) {
+    return code == ERROR_BAD_NET_NAME || code == ERROR_PATH_NOT_FOUND || code == ERROR_FILE_NOT_FOUND || code == ERROR_SERVICE_EXISTS;
+}
+
+bool stopAndDeleteService(SC_HANDLE manager, const wchar_t* name) {
+    SC_HANDLE service = OpenServiceW(manager, name, SERVICE_STOP | DELETE | SERVICE_QUERY_STATUS);
+    if (!service) return GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST;
+
+    SERVICE_STATUS status{};
+    ControlService(service, SERVICE_CONTROL_STOP, &status);
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        SERVICE_STATUS_PROCESS processStatus{};
+        DWORD needed{};
+        if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&processStatus), sizeof(processStatus), &needed)) break;
+        if (processStatus.dwCurrentState == SERVICE_STOPPED) break;
+        Sleep(100);
+    }
+
+    BOOL deleted = DeleteService(service);
+    DWORD errorCode = GetLastError();
+    CloseServiceHandle(service);
+    return deleted || errorCode == ERROR_SERVICE_MARKED_FOR_DELETE || errorCode == ERROR_SERVICE_DOES_NOT_EXIST;
+}
+
+bool resetWinDivertService() {
+    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!manager) return false;
+    bool ok = stopAndDeleteService(manager, L"WinDivert");
+    ok = stopAndDeleteService(manager, L"WinDivert1.4") && ok;
+    ok = stopAndDeleteService(manager, L"WinDivert2") && ok;
+    CloseServiceHandle(manager);
+    return ok;
+}
+
+std::wstring windivertOpenError(const wchar_t* layer, DWORD code, const std::wstring& executablePath) {
+    if (code == ERROR_ACCESS_DENIED) return L"Фильтру процессов нужны права администратора";
+    if (code == ERROR_BAD_NET_NAME || isNetworkPath(executablePath)) {
+        return std::wstring(L"WinDivert ") + layer +
+            L" не может загрузить драйвер. Попробуйте запустить EXE с локального пути без OneDrive/синхронизации, например C:\\BigHeadVPN-Native.";
+    }
+    std::wstring details = win32Message(code);
+    return std::wstring(L"WinDivert ") + layer + L" error " + std::to_wstring(code) + (details.empty() ? L"" : L": " + details);
+}
+
+std::filesystem::path findWinDivertRuntime(const std::filesystem::path& exeDir, std::wstring& error) {
+    auto sourceDll = exeDir / L"WinDivert.dll";
+    auto sourceDriver = exeDir / L"WinDivert64.sys";
+    std::error_code fsError;
+    if (!std::filesystem::exists(sourceDll, fsError)) {
+        error = L"Рядом с EXE отсутствует WinDivert.dll";
+        return {};
+    }
+    if (!std::filesystem::exists(sourceDriver, fsError)) {
+        error = L"Рядом с EXE отсутствует WinDivert64.sys";
+        return {};
+    }
+
+    return sourceDll;
+}
 }
 
 struct ProcessFilter::Impl {
@@ -108,7 +190,7 @@ struct ProcessFilter::Impl {
     HANDLE socketHandle{INVALID_HANDLE_VALUE}, flowHandle{INVALID_HANDLE_VALUE}, networkHandle{INVALID_HANDLE_VALUE};
     SOCKET listener{INVALID_SOCKET}, listener6{INVALID_SOCKET};
     uint16_t proxyPort{};
-    HysteriaClient* client{};
+    TunnelClient* client{};
     std::vector<std::wstring> names;
     std::atomic_bool stopping{};
     std::atomic_ullong matched{}, redirected{}, proxyReplies{}, accepted{}, acceptAttempts{}, natMisses{}, udpMatched{}, udpSent{}, udpReceived{}, socketEventCount{}, namedProcessCount{}, injectionFailureCount{};
@@ -134,9 +216,10 @@ struct ProcessFilter::Impl {
     bool initialize(std::wstring& error) {
         wchar_t executable[MAX_PATH]{};
         if (!GetModuleFileNameW(nullptr, executable, static_cast<DWORD>(std::size(executable)))) { error = L"Не найдена папка приложения"; return false; }
-        auto dll = std::filesystem::path(executable).parent_path() / L"WinDivert.dll";
+        auto dll = findWinDivertRuntime(std::filesystem::path(executable).parent_path(), error);
+        if (dll.empty()) return false;
         module = LoadLibraryExW(dll.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if (!module) { error = L"Рядом с EXE отсутствует WinDivert.dll"; return false; }
+        if (!module) { error = L"Не удалось загрузить WinDivert.dll из " + dll.parent_path().wstring() + L": " + win32Message(GetLastError()); return false; }
 #define LOAD(name, field) field = reinterpret_cast<decltype(field)>(GetProcAddress(module, name)); if (!field) { error = L"Некорректная WinDivert.dll"; return false; }
         LOAD("WinDivertOpen", open) LOAD("WinDivertRecv", receive) LOAD("WinDivertSend", inject)
         LOAD("WinDivertClose", close) LOAD("WinDivertHelperParsePacket", parse)
@@ -157,19 +240,31 @@ struct ProcessFilter::Impl {
                 closesocket(listener6); listener6 = INVALID_SOCKET;
             }
         }
+        std::wstring executablePath(executable);
         socketHandle = open("true", WINDIVERT_LAYER_SOCKET, 1200, WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY);
-        if (socketHandle == INVALID_HANDLE_VALUE) { DWORD code = GetLastError(); error = code == ERROR_ACCESS_DENIED ? L"Фильтру процессов нужны права администратора" : L"WinDivert SOCKET error " + std::to_wstring(code); return false; }
-        flowHandle = open("outbound and udp", WINDIVERT_LAYER_FLOW, 1200, WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY);
-        if (flowHandle == INVALID_HANDLE_VALUE) { error = L"WinDivert FLOW error " + std::to_wstring(GetLastError()); return false; }
-        std::string networkFilter = "(tcp and outbound and (!loopback or tcp.SrcPort == " + std::to_string(proxyPort) + ")) or (udp and outbound and !loopback)";
+        if (socketHandle == INVALID_HANDLE_VALUE) {
+            DWORD code = GetLastError();
+            if (transientWinDivertDriverError(code) && resetWinDivertService()) {
+                Sleep(300);
+                socketHandle = open("true", WINDIVERT_LAYER_SOCKET, 1200, WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY);
+                if (socketHandle == INVALID_HANDLE_VALUE) code = GetLastError();
+            }
+            if (socketHandle == INVALID_HANDLE_VALUE) { error = windivertOpenError(L"SOCKET", code, executablePath); return false; }
+        }
+        if (client->supportsUdp()) {
+            flowHandle = open("outbound and udp", WINDIVERT_LAYER_FLOW, 1200, WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY);
+            if (flowHandle == INVALID_HANDLE_VALUE) { error = windivertOpenError(L"FLOW", GetLastError(), executablePath); return false; }
+        }
+        std::string networkFilter = "tcp and outbound and (!loopback or tcp.SrcPort == " + std::to_string(proxyPort) + ")";
+        if (client->supportsUdp()) networkFilter = "(" + networkFilter + ") or (udp and outbound and !loopback)";
         networkHandle = open(networkFilter.c_str(), WINDIVERT_LAYER_NETWORK, 1100, 0);
-        if (networkHandle == INVALID_HANDLE_VALUE) { error = L"WinDivert NETWORK error " + std::to_wstring(GetLastError()); return false; }
+        if (networkHandle == INVALID_HANDLE_VALUE) { error = windivertOpenError(L"NETWORK", GetLastError(), executablePath); return false; }
         nextUdpSession = static_cast<uint32_t>(GetTickCount64()) | 1U;
-        client->setUdpReceiveHandler([this](uint32_t session, const std::string&, std::vector<unsigned char> payload) {
+        if (client->supportsUdp()) client->setUdpReceiveHandler([this](uint32_t session, const std::string&, std::vector<unsigned char> payload) {
             injectUdp(session, std::move(payload));
         });
         socketThread = std::thread([this] { socketLoop(); });
-        flowThread = std::thread([this] { udpFlowLoop(); });
+        if (client->supportsUdp()) flowThread = std::thread([this] { udpFlowLoop(); });
         networkThread = std::thread([this] { networkLoop(); });
         acceptThread = std::thread([this] { acceptLoop(); });
         if (listener6 != INVALID_SOCKET) acceptThread6 = std::thread([this] { acceptLoop6(); });
@@ -490,7 +585,7 @@ unsigned long long ProcessFilter::namedProcesses() const { return implementation
 unsigned long long ProcessFilter::injectionFailures() const { return implementation_ ? implementation_->injectionFailureCount.load() : 0; }
 unsigned long ProcessFilter::lastInjectionError() const { return implementation_ ? implementation_->injectionError.load() : 0; }
 
-std::unique_ptr<ProcessFilter> ProcessFilter::start(std::vector<std::wstring> executableNames, HysteriaClient& client, std::wstring& error) {
+std::unique_ptr<ProcessFilter> ProcessFilter::start(std::vector<std::wstring> executableNames, TunnelClient& client, std::wstring& error) {
     auto implementation = std::make_unique<Impl>(); implementation->client = &client;
     for (auto& name : executableNames) { name = lower(std::filesystem::path(name).filename().wstring()); if (!name.empty()) implementation->names.push_back(std::move(name)); }
     if (implementation->names.empty()) { error = L"Добавьте хотя бы одно имя процесса, например Discord.exe"; return nullptr; }

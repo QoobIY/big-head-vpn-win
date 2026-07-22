@@ -1,4 +1,5 @@
 #pragma once
+#include "tunnel_client.h"
 
 #include <memory>
 #include <cstdint>
@@ -10,28 +11,24 @@
 std::vector<unsigned char> hysteriaAuthFixtureForTest();
 #endif
 
-struct HysteriaConnectResult {
-    bool connected{};
-    bool udpEnabled{};
-    std::wstring message;
-};
+using HysteriaConnectResult = TunnelConnectResult;
 
-class HysteriaClient {
+class HysteriaClient : public TunnelClient {
 public:
-    using UdpReceiveHandler = std::function<void(uint32_t, const std::string&, std::vector<unsigned char>)>;
     static std::unique_ptr<HysteriaClient> connect(
         const std::wstring& uri,
         HysteriaConnectResult& result);
 
-    ~HysteriaClient();
+    ~HysteriaClient() override;
     HysteriaClient(const HysteriaClient&) = delete;
     HysteriaClient& operator=(const HysteriaClient&) = delete;
 
-    void stop();
-    bool relayTcp(const std::string& destination, std::uintptr_t socket, std::wstring& error, bool socksReply = true);
-    bool sendUdp(uint32_t sessionId, const std::string& destination, const unsigned char* data, size_t length, std::wstring& error);
-    void setUdpReceiveHandler(UdpReceiveHandler handler);
-    std::wstring udpDiagnostics() const;
+    void stop() override;
+    bool relayTcp(const std::string& destination, std::uintptr_t socket, std::wstring& error, bool socksReply = true) override;
+    bool sendUdp(uint32_t sessionId, const std::string& destination, const unsigned char* data, size_t length, std::wstring& error) override;
+    void setUdpReceiveHandler(UdpReceiveHandler handler) override;
+    std::wstring udpDiagnostics() const override;
+    bool supportsUdp() const override { return true; }
 
 private:
     struct Impl;

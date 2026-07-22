@@ -1,6 +1,11 @@
 #include "hysteria_client.h"
+#include "vless_client.h"
+#include "tunnel_client.h"
 #include "socks_server.h"
 #include "process_filter.h"
+#include "autostart.h"
+#include "schannel_tls.h"
+#include "http2_connection.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -37,11 +42,110 @@ std::string utf8(const std::wstring& value) {
 }
 
 int wmain(int argc, wchar_t** argv) {
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--vless-fixture") {
+        std::wstring error;
+        bool passed = vlessProtocolFixtureForTest(error);
+        std::cout << (passed ? "vless_fixture_ok" : "vless_fixture_failed ")
+                  << (passed ? "" : utf8(error)) << std::endl;
+        return passed ? 0 : 1;
+    }
+    if (argc == 3 && std::wstring_view(argv[1]) == L"--tunnel-udp-uri") {
+        TunnelConnectResult result;
+        auto client = connectTunnel(argv[2], result);
+        if (!client || !client->supportsUdp()) {
+            std::cout << "udp_connect_failed " << utf8(result.message) << std::endl;
+            return 1;
+        }
+        std::mutex mutex;
+        std::condition_variable changed;
+        unsigned received = 0;
+        size_t responseLength = 0;
+        client->setUdpReceiveHandler([&](uint32_t session, const std::string&, std::vector<unsigned char> payload) {
+            if (session != 1) return;
+            std::lock_guard lock(mutex);
+            ++received;
+            responseLength = payload.size();
+            changed.notify_all();
+        });
+        const unsigned char stun[]{0x00,0x01,0x00,0x00,0x21,0x12,0xA4,0x42,
+            0x42,0x69,0x67,0x48,0x65,0x61,0x64,0x56,0x50,0x4E,0x30,0x31};
+        std::wstring error;
+        bool sent = client->sendUdp(1, "stun.l.google.com:19302", stun, sizeof(stun), error);
+        auto second = std::to_array(stun);
+        second.back() ^= 1;
+        sent = sent && client->sendUdp(1, "stun.l.google.com:19302", second.data(), second.size(), error);
+        if (sent) {
+            std::unique_lock lock(mutex);
+            changed.wait_for(lock, std::chrono::seconds(15), [&] { return received >= 2; });
+        }
+        std::cout << (received >= 2 ? "udp_responses=2 last_bytes=" + std::to_string(responseLength) : "udp_failed ")
+                  << (received >= 2 ? "" : utf8(error)) << " " << utf8(client->udpDiagnostics()) << std::endl;
+        client->stop();
+        return received >= 2 ? 0 : 1;
+    }
+    if (argc == 4 && (std::wstring_view(argv[1]) == L"--socks-uri" ||
+            std::wstring_view(argv[1]) == L"--socks-uri-stop")) {
+        bool stopTest = std::wstring_view(argv[1]) == L"--socks-uri-stop";
+        TunnelConnectResult result;
+        auto client = connectTunnel(argv[2], result);
+        if (!client) { std::cout << "connect_failed " << utf8(result.message) << std::endl; return 1; }
+        std::wstring error;
+        auto server = SocksServer::start(L"127.0.0.1", static_cast<unsigned short>(_wtoi(argv[3])), *client, error);
+        if (!server) { std::cout << "listen_failed " << utf8(error) << std::endl; return 1; }
+        std::cout << "socks_ready" << std::endl;
+        if (stopTest) {
+            std::this_thread::sleep_for(std::chrono::seconds(8));
+            auto before = std::chrono::steady_clock::now();
+            client->stop();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - before).count();
+            std::cout << "vless_stop_ms=" << elapsed << std::endl;
+        } else std::this_thread::sleep_for(std::chrono::seconds(30));
+        return 0;
+    }
+    if (argc == 5 && std::wstring_view(argv[1]) == L"--h2-get") {
+        WSADATA winsock{};
+        if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) return 1;
+        Http2Connection http;
+        std::wstring error;
+        std::string authority = utf8(argv[2]);
+        bool connected = http.connect(argv[2], static_cast<unsigned short>(_wtoi(argv[3])), authority, error);
+        int32_t stream = connected ? http.open(utf8(argv[4]), {{"accept", "*/*"}}, {}, {}, error) : -1;
+        unsigned status{};
+        bool answered = stream >= 0 && http.waitHeaders(stream, status, error, 5000);
+        std::cout << (answered ? "h2_response status=" + std::to_string(status) : "h2_failed ")
+                  << (answered ? "" : utf8(error)) << std::endl;
+        http.close();
+        WSACleanup();
+        return answered ? 0 : 1;
+    }
+    if (argc == 4 && std::wstring_view(argv[1]) == L"--tls-h2") {
+        WSADATA winsock{};
+        if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) return 1;
+        SchannelTls tls;
+        std::wstring error;
+        bool connected = tls.connect(argv[2], static_cast<unsigned short>(_wtoi(argv[3])), error);
+        std::cout << (connected ? "tls_h2_ready" : "tls_h2_failed ") << utf8(error) << std::endl;
+        tls.close();
+        WSACleanup();
+        return connected ? 0 : 1;
+    }
     if (argc == 2 && std::wstring_view(argv[1]) == L"--fixture") {
         for (unsigned char byte : hysteriaAuthFixtureForTest())
             std::cout << std::hex << std::setfill('0') << std::setw(2) << static_cast<unsigned>(byte);
         std::cout << '\n';
         return 0;
+    }
+    if (argc == 3 && std::wstring_view(argv[1]) == L"--autostart-cycle") {
+        std::wstring error;
+        bool before = isAutostartEnabled(error);
+        bool enabled = before || setAutostartEnabled(true, error);
+        bool visible = enabled && isAutostartEnabled(error);
+        bool cleaned = before || setAutostartEnabled(false, error);
+        std::ofstream status(std::filesystem::path(argv[2]), std::ios::trunc);
+        status << "before=" << before << " enabled=" << enabled << " visible=" << visible << " cleaned=" << cleaned
+               << " error=" << utf8(error) << '\n';
+        return enabled && visible && cleaned ? 0 : 1;
     }
     if (argc == 4 && std::wstring_view(argv[1]) == L"--socks-udp") {
         WSADATA winsock{};
@@ -101,7 +205,8 @@ int wmain(int argc, wchar_t** argv) {
     std::string line;
     std::vector<std::string> profiles;
     while (std::getline(input, line)) {
-        if (line.rfind("hysteria2://", 0) == 0 || line.rfind("hy2://", 0) == 0) profiles.push_back(line);
+        if (line.rfind("hysteria2://", 0) == 0 || line.rfind("hy2://", 0) == 0 ||
+            (socksMode && line.rfind("vless://", 0) == 0 && line.find("type=xhttp") != std::string::npos)) profiles.push_back(line);
     }
     if (profiles.empty()) { std::wcerr << L"no Hysteria2 profile\n"; return 3; }
     if (udpMode) {
@@ -131,8 +236,8 @@ int wmain(int argc, wchar_t** argv) {
         return received ? 0 : 1;
     }
     if (socksMode) {
-        HysteriaConnectResult result;
-        auto client = HysteriaClient::connect(wide(profiles.front()), result);
+        TunnelConnectResult result;
+        auto client = connectTunnel(wide(profiles.front()), result);
         if (!client) { std::cout << "connect_failed\n"; return 1; }
         wchar_t* end{}; unsigned long port = wcstoul(argv[3], &end, 10);
         std::wstring error;

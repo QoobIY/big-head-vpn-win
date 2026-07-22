@@ -18,6 +18,11 @@ LSQPACK_DIR="$TOOLS_DIR/ls-qpack"
 LSQPACK_ARCHIVE="$TOOLS_DIR/ls-qpack-771a794.tar.gz"
 LSQPACK_URL="https://codeload.github.com/litespeedtech/ls-qpack/tar.gz/771a794d7dfcc6132576136f62db3065493d876f"
 LSQPACK_SHA256="fd91d0150a14ec4e5df13ad78843b107d8583cf0ea0981f48b3ac4bc5b59bd75"
+NGHTTP2_VERSION="1.69.0"
+NGHTTP2_DIR="$TOOLS_DIR/nghttp2"
+NGHTTP2_ARCHIVE="$TOOLS_DIR/nghttp2-$NGHTTP2_VERSION.tar.xz"
+NGHTTP2_URL="https://github.com/nghttp2/nghttp2/releases/download/v$NGHTTP2_VERSION/nghttp2-$NGHTTP2_VERSION.tar.xz"
+NGHTTP2_SHA256="1fb324b6ec2c56f6bde0658f4139ffd8209fa9e77ce98fd7a5f63af8d0e508ad"
 WINDIVERT_DIR="$TOOLS_DIR/windivert"
 WINDIVERT_ARCHIVE="$TOOLS_DIR/WinDivert-2.2.2-A.zip"
 WINDIVERT_URL="https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip"
@@ -43,6 +48,15 @@ if [[ ! -f "$LSQPACK_DIR/lsqpack.c" ]]; then
   rm -rf "$LSQPACK_DIR"
   mkdir -p "$LSQPACK_DIR"
   tar -xzf "$LSQPACK_ARCHIVE" --strip-components=1 -C "$LSQPACK_DIR"
+fi
+
+if [[ ! -f "$NGHTTP2_DIR/lib/nghttp2_session.c" ]]; then
+  echo "Скачиваю закреплённый nghttp2 $NGHTTP2_VERSION..."
+  curl -fL "$NGHTTP2_URL" -o "$NGHTTP2_ARCHIVE"
+  echo "$NGHTTP2_SHA256  $NGHTTP2_ARCHIVE" | sha256sum -c -
+  rm -rf "$NGHTTP2_DIR"
+  mkdir -p "$NGHTTP2_DIR"
+  tar -xJf "$NGHTTP2_ARCHIVE" --strip-components=1 -C "$NGHTTP2_DIR"
 fi
 
 if [[ ! -f "$MSQUIC_DIR/bin/msquic.dll" || ! -f "$MSQUIC_DIR/include/msquic.h" ]]; then

@@ -1,5 +1,5 @@
 #include "socks_server.h"
-#include "hysteria_client.h"
+#include "tunnel_client.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -44,7 +45,7 @@ std::string utf8(const std::wstring& value) {
 
 struct SocksServer::Impl {
     SOCKET listener{INVALID_SOCKET};
-    HysteriaClient* client{};
+    TunnelClient* client{};
     std::atomic_bool stopping{};
     std::thread acceptThread;
     std::mutex workersMutex;
@@ -112,7 +113,13 @@ struct SocksServer::Impl {
         unsigned char portBytes[2]{}; if (!receiveAll(socket, portBytes, 2)) return closeClient(socket);
         unsigned port = (static_cast<unsigned>(portBytes[0]) << 8U) | portBytes[1];
         std::wstring error;
-        if (!client->relayTcp(host + ":" + std::to_string(port), static_cast<std::uintptr_t>(socket), error)) { rejectRequest(socket, 5); return; }
+        if (!client->relayTcp(host + ":" + std::to_string(port), static_cast<std::uintptr_t>(socket), error)) {
+#ifdef BIG_HEAD_VPN_TESTING
+            fwprintf(stderr, L"relay_failed: %ls\n", error.c_str());
+            fflush(stderr);
+#endif
+            rejectRequest(socket, 5); return;
+        }
         closeClient(socket);
     }
 
@@ -146,7 +153,7 @@ struct SocksServer::Impl {
 SocksServer::SocksServer(std::unique_ptr<Impl> implementation) : implementation_(std::move(implementation)) {}
 SocksServer::~SocksServer() = default;
 
-std::unique_ptr<SocksServer> SocksServer::start(const std::wstring& address, unsigned short port, HysteriaClient& client, std::wstring& error) {
+std::unique_ptr<SocksServer> SocksServer::start(const std::wstring& address, unsigned short port, TunnelClient& client, std::wstring& error) {
     auto implementation = std::make_unique<Impl>(); implementation->client = &client;
     if (!implementation->initialize(address, port, error)) return nullptr;
     return std::unique_ptr<SocksServer>(new SocksServer(std::move(implementation)));

@@ -1,12 +1,15 @@
 #include "model.h"
-#include "hysteria_client.h"
+#include "tunnel_client.h"
 #include "subscription.h"
 #include "socks_server.h"
 #include "process_filter.h"
+#include "autostart.h"
 
 #include <windows.h>
+#include <windowsx.h>
 #include <commctrl.h>
 #include <dwmapi.h>
+#include <shellapi.h>
 #include <tlhelp32.h>
 #include <uxtheme.h>
 
@@ -17,7 +20,6 @@
 
 namespace {
 constexpr COLORREF BACKGROUND = RGB(18, 20, 25);
-constexpr COLORREF SIDEBAR = RGB(12, 14, 18);
 constexpr COLORREF CARD = RGB(25, 28, 35);
 constexpr COLORREF INPUT = RGB(15, 17, 22);
 constexpr COLORREF BORDER = RGB(43, 47, 58);
@@ -27,16 +29,20 @@ constexpr COLORREF ACCENT = RGB(88, 101, 242);
 constexpr COLORREF ERROR_RED = RGB(218, 55, 60);
 
 enum ControlId {
-    ID_NAV_HOME = 100, ID_NAV_SERVERS, ID_NAV_SETTINGS,
-    ID_CONNECT, ID_GROUPS, ID_PROFILES, ID_URL, ID_ADD_SUBSCRIPTION,
+    ID_CONNECT = 100, ID_GROUPS, ID_PROFILES, ID_URL, ID_ADD_SUBSCRIPTION,
     ID_UPDATE_GROUP, ID_DELETE_GROUP, ID_LOG, ID_COPY_LOG, ID_CLEAR_LOG,
     ID_ADDRESS, ID_PORT, ID_RUNNING_PROCESSES, ID_SELECTED_PROCESSES,
-    ID_REFRESH_PROCESSES, ID_ADD_PROCESS, ID_REMOVE_PROCESS
+    ID_REFRESH_PROCESSES, ID_ADD_PROCESS, ID_REMOVE_PROCESS, ID_AUTOSTART,
+    ID_TRAY_OPEN = 200, ID_TRAY_TOGGLE, ID_TRAY_EXIT
 };
 constexpr UINT WM_SUBSCRIPTION_READY = WM_APP + 10;
 constexpr UINT WM_CONNECT_READY = WM_APP + 11;
+constexpr UINT WM_TRAY = WM_APP + 12;
 constexpr UINT_PTR FILTER_STATUS_TIMER = 1;
 constexpr int IDR_MANROPE = 101;
+constexpr UINT TRAY_ICON_ID = 1;
+
+UINT taskbarCreatedMessage{};
 
 struct DownloadPayload {
     SubscriptionResult result;
@@ -45,8 +51,8 @@ struct DownloadPayload {
 };
 
 struct ConnectPayload {
-    HysteriaConnectResult result;
-    std::unique_ptr<HysteriaClient> session;
+    TunnelConnectResult result;
+    std::unique_ptr<TunnelClient> session;
 };
 
 struct App {
@@ -54,20 +60,76 @@ struct App {
     HWND banner{}, status{}, connect{}, groups{}, profiles{}, url{}, add{}, update{}, remove{};
     HWND log{}, address{}, port{};
     HWND runningProcesses{}, selectedProcesses{}, refreshProcesses{}, addProcess{}, removeProcess{};
-    HWND filterStatus{};
+    HWND filterStatus{}, autostart{};
     HFONT regular{}, medium{}, title{}, small{};
-    HBRUSH background{}, sidebar{}, card{}, input{};
+    HBRUSH background{}, card{}, input{};
     HANDLE fontResource{};
     AppModel model;
     bool busy{};
     bool connecting{};
-    std::unique_ptr<HysteriaClient> session;
+    bool autostartEnabled{};
+    bool trayAdded{};
+    bool exiting{};
+    std::unique_ptr<TunnelClient> session;
     std::unique_ptr<SocksServer> socks;
     std::unique_ptr<ProcessFilter> processFilter;
     unsigned long long lastMatched{}, lastRedirected{}, lastProxyReplies{}, lastAccepted{}, lastAcceptAttempts{}, lastNatMisses{}, lastUdpMatched{}, lastUdpSent{}, lastUdpReceived{}, lastInjectionFailures{};
 };
 
 App app;
+
+void updateTrayIcon();
+
+void restoreWindow() {
+    if (IsIconic(app.window)) ShowWindow(app.window, SW_RESTORE);
+    else ShowWindow(app.window, SW_SHOW);
+    SetForegroundWindow(app.window);
+}
+
+void removeTrayIcon() {
+    if (!app.trayAdded) return;
+    NOTIFYICONDATAW icon{};
+    icon.cbSize = sizeof(icon);
+    icon.hWnd = app.window;
+    icon.uID = TRAY_ICON_ID;
+    Shell_NotifyIconW(NIM_DELETE, &icon);
+    app.trayAdded = false;
+}
+
+void updateTrayIcon() {
+    NOTIFYICONDATAW icon{};
+    icon.cbSize = sizeof(icon);
+    icon.hWnd = app.window;
+    icon.uID = TRAY_ICON_ID;
+    icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    icon.uCallbackMessage = WM_TRAY;
+    icon.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1));
+    const wchar_t* tip = app.session ? L"Big Head VPN — подключено" : L"Big Head VPN — отключено";
+    wcsncpy_s(icon.szTip, tip, _TRUNCATE);
+    if (!app.trayAdded) {
+        app.trayAdded = Shell_NotifyIconW(NIM_ADD, &icon) != FALSE;
+        if (app.trayAdded) {
+            icon.uVersion = NOTIFYICON_VERSION_4;
+            Shell_NotifyIconW(NIM_SETVERSION, &icon);
+        }
+    } else {
+        Shell_NotifyIconW(NIM_MODIFY, &icon);
+    }
+}
+
+void showTrayMenu(POINT point) {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING | MF_DEFAULT, ID_TRAY_OPEN, L"Открыть Big Head VPN");
+    AppendMenuW(menu, MF_STRING, ID_TRAY_TOGGLE, app.session ? L"Отключить VPN" : L"Подключить VPN");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, L"Выход");
+    SetForegroundWindow(app.window);
+    UINT command = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+        point.x, point.y, 0, app.window, nullptr);
+    DestroyMenu(menu);
+    if (command) PostMessageW(app.window, WM_COMMAND, MAKEWPARAM(command, 0), 0);
+}
 
 std::wstring windowText(HWND control) {
     int length = GetWindowTextLengthW(control);
@@ -77,6 +139,12 @@ std::wstring windowText(HWND control) {
 }
 
 void setFont(HWND control, HFONT font) { SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE); }
+
+void updateAutostartButton() {
+    if (!app.autostart) return;
+    SetWindowTextW(app.autostart, app.autostartEnabled ? L"● Автозагрузка включена" : L"○ Автозагрузка выключена");
+    InvalidateRect(app.autostart, nullptr, TRUE);
+}
 
 HWND control(const wchar_t* cls, const wchar_t* text, DWORD style, int id) {
     HWND value = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style,
@@ -164,12 +232,12 @@ void beginConnect(const std::wstring& uri) {
     app.connecting = true;
     EnableWindow(app.connect, FALSE);
     SetWindowTextW(app.connect, L"Подключение…");
-    showBanner(L"Выполняю QUIC/TLS и HTTP/3 авторизацию…");
-    appendLog(L"Запуск Hysteria2 handshake");
+    showBanner(uri.rfind(L"vless://", 0) == 0 ? L"Подготавливаю VLESS XHTTP/TLS…" : L"Выполняю QUIC/TLS и HTTP/3 авторизацию…");
+    appendLog(uri.rfind(L"vless://", 0) == 0 ? L"Запуск VLESS XHTTP/TLS" : L"Запуск Hysteria2 handshake");
     HWND target = app.window;
     std::thread([target, uri] {
         auto payload = std::make_unique<ConnectPayload>();
-        payload->session = HysteriaClient::connect(uri, payload->result);
+        payload->session = connectTunnel(uri, payload->result);
         PostMessageW(target, WM_CONNECT_READY, 0, reinterpret_cast<LPARAM>(payload.release()));
     }).detach();
 }
@@ -296,11 +364,10 @@ void saveListenerFields() {
 }
 
 void layout(int width, int height) {
-    int side = 190, margin = 24, top = 126;
-    MoveWindow(app.banner, side + margin, 68, width - side - margin * 2, 40, TRUE);
-    HWND home = GetDlgItem(app.window, ID_NAV_HOME), servers = GetDlgItem(app.window, ID_NAV_SERVERS), settings = GetDlgItem(app.window, ID_NAV_SETTINGS);
-    MoveWindow(home, 16, 96, side - 32, 44, TRUE); MoveWindow(servers, 16, 148, side - 32, 44, TRUE); MoveWindow(settings, 16, 200, side - 32, 44, TRUE);
-    int contentX = side + margin, contentW = width - contentX - margin;
+    int margin = 24, top = 126;
+    MoveWindow(app.banner, margin, 68, width - margin * 2, 40, TRUE);
+    MoveWindow(app.autostart, width - margin - 246, 20, 246, 36, TRUE);
+    int contentX = margin, contentW = width - margin * 2;
     int leftW = std::max(360, contentW * 55 / 100), gap = 18, rightX = contentX + leftW + gap, rightW = contentW - leftW - gap;
     MoveWindow(app.status, contentX + 20, top + 18, leftW - 40, 28, TRUE);
     MoveWindow(app.connect, contentX + 20, top + 56, leftW - 40, 44, TRUE);
@@ -343,20 +410,19 @@ void label(HDC dc, int x, int y, const wchar_t* text) {
 
 void paint(HDC dc, const RECT& client) {
     FillRect(dc, &client, app.background);
-    RECT side{0, 0, 190, client.bottom}; FillRect(dc, &side, app.sidebar);
-    RECT left{214, 126, 214 + std::max(360L, (client.right - 238) * 55L / 100), client.bottom - 18}; roundedBox(dc, left, CARD, BORDER);
+    constexpr int margin = 24;
+    RECT left{margin, 126, margin + std::max(360L, (client.right - margin * 2L) * 55L / 100), client.bottom - 18}; roundedBox(dc, left, CARD, BORDER);
     int rightX = left.right + 18;
     RECT right{rightX, 126, client.right - 24, client.bottom - 18}; roundedBox(dc, right, CARD, BORDER);
     SetBkMode(dc, TRANSPARENT); SetTextColor(dc, TEXT);
     SelectObject(dc, app.title);
     HICON icon = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, 38, 38, LR_DEFAULTCOLOR));
-    if (icon) { DrawIconEx(dc, 18, 20, icon, 38, 38, 0, nullptr, DI_NORMAL); DestroyIcon(icon); }
-    TextOutW(dc, 68, 27, L"BIG HEAD", 8);
-    TextOutW(dc, 214, 24, L"Big Head VPN", 12);
+    if (icon) { DrawIconEx(dc, 24, 18, icon, 38, 38, 0, nullptr, DI_NORMAL); DestroyIcon(icon); }
+    TextOutW(dc, 72, 19, L"Big Head VPN", 12);
     SelectObject(dc, app.regular); SetTextColor(dc, MUTED);
     constexpr wchar_t subtitle[] = L"Лёгкий нативный клиент для Windows";
-    TextOutW(dc, 215, 49, subtitle, static_cast<int>(std::size(subtitle) - 1));
-    label(dc, 234, 247, L"СЕРВЕРЫ И ПОДПИСКИ");
+    TextOutW(dc, 73, 48, subtitle, static_cast<int>(std::size(subtitle) - 1));
+    label(dc, margin + 20, 247, L"СЕРВЕРЫ И ПОДПИСКИ");
     label(dc, rightX + 20, 143, L"ЛОКАЛЬНЫЙ SOCKS5");
     label(dc, rightX + 20, 213, L"ПРОЦЕССЫ ЧЕРЕЗ VPN");
     label(dc, rightX + 20, 258, L"ЗАПУЩЕННЫЕ");
@@ -369,11 +435,10 @@ void paint(HDC dc, const RECT& client) {
 void drawButton(const DRAWITEMSTRUCT& item) {
     bool primary = item.CtlID == ID_CONNECT || item.CtlID == ID_ADD_SUBSCRIPTION || item.CtlID == ID_ADD_PROCESS;
     bool disabled = (item.itemState & ODS_DISABLED) != 0;
-    bool home = item.CtlID == ID_NAV_HOME;
-    COLORREF color = disabled ? RGB(54, 57, 66) : primary ? ACCENT : home ? RGB(45, 50, 69) : RGB(47, 51, 61);
+    bool activeAutostart = item.CtlID == ID_AUTOSTART && app.autostartEnabled;
+    COLORREF color = disabled ? RGB(54, 57, 66) : activeAutostart ? RGB(41, 126, 85) : primary ? ACCENT : RGB(47, 51, 61);
     if ((item.itemState & ODS_SELECTED) && !disabled) color = primary ? RGB(71, 82, 196) : RGB(62, 64, 70);
-    bool navigation = item.CtlID == ID_NAV_HOME || item.CtlID == ID_NAV_SERVERS || item.CtlID == ID_NAV_SETTINGS;
-    RECT background = item.rcItem; FillRect(item.hDC, &background, navigation ? app.sidebar : app.card);
+    RECT background = item.rcItem; FillRect(item.hDC, &background, app.card);
     roundedBox(item.hDC, item.rcItem, color, color, 10);
     wchar_t label[128]{};
     GetWindowTextW(item.hwndItem, label, static_cast<int>(std::size(label)));
@@ -418,7 +483,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     switch (message) {
     case WM_CREATE: {
         app.window = hwnd;
-        app.background = CreateSolidBrush(BACKGROUND); app.sidebar = CreateSolidBrush(SIDEBAR); app.card = CreateSolidBrush(CARD); app.input = CreateSolidBrush(INPUT);
+        updateTrayIcon();
+        app.background = CreateSolidBrush(BACKGROUND); app.card = CreateSolidBrush(CARD); app.input = CreateSolidBrush(INPUT);
         HRSRC fontInfo = FindResourceW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDR_MANROPE), RT_RCDATA);
         if (fontInfo) {
             HGLOBAL fontData = LoadResource(GetModuleHandleW(nullptr), fontInfo);
@@ -431,9 +497,9 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         app.small = CreateFontW(-12, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
         app.title = CreateFontW(-25, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
         app.model.load();
-        button(L"Главная", ID_NAV_HOME);
-        button(L"Серверы", ID_NAV_SERVERS);
-        button(L"Настройки", ID_NAV_SETTINGS);
+        std::wstring autostartError;
+        app.autostartEnabled = isAutostartEnabled(autostartError);
+        app.autostart = button(L"", ID_AUTOSTART); updateAutostartButton();
         app.banner = control(L"STATIC", L"", SS_OWNERDRAW, 0); ShowWindow(app.banner, SW_HIDE);
         app.status = control(L"STATIC", L"Добавьте подписку и выберите сервер", SS_LEFT | SS_CENTERIMAGE, 0); setFont(app.status, app.medium);
         app.connect = button(L"Подключить", ID_CONNECT); setFont(app.connect, app.medium);
@@ -459,14 +525,31 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         button(L"Копировать", ID_COPY_LOG);
         button(L"Очистить", ID_CLEAR_LOG);
         refillGroups(); refillSelectedProcesses(); refreshRunningProcesses(); updateFilterStatus(); appendLog(L"Нативное приложение запущено");
+        if (!autostartError.empty()) appendLog(L"Автозагрузка: " + autostartError);
         SetTimer(hwnd, FILTER_STATUS_TIMER, 1500, nullptr);
-        showBanner(L"Hysteria2 TCP через SOCKS5 готов; выберите сервер и подключитесь");
+        showBanner(L"Hysteria2 и VLESS XHTTP готовы; выберите сервер и подключитесь");
         return 0;
     }
     case WM_SIZE: layout(LOWORD(lParam), HIWORD(lParam)); return 0;
     case WM_TIMER:
         if (wParam == FILTER_STATUS_TIMER) updateFilterStatus(true);
         return 0;
+    case WM_TRAY: {
+        UINT event = LOWORD(lParam);
+        if (event == WM_LBUTTONDBLCLK || event == NIN_SELECT || event == NIN_KEYSELECT) {
+            restoreWindow();
+        } else if (event == WM_CONTEXTMENU || event == WM_RBUTTONUP) {
+            POINT point{};
+            if (event == WM_CONTEXTMENU) {
+                point.x = GET_X_LPARAM(wParam);
+                point.y = GET_Y_LPARAM(wParam);
+            } else {
+                GetCursorPos(&point);
+            }
+            showTrayMenu(point);
+        }
+        return 0;
+    }
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps{}; HDC dc = BeginPaint(hwnd, &ps); RECT client{}; GetClientRect(hwnd, &client); paint(dc, client); EndPaint(hwnd, &ps); return 0;
@@ -500,7 +583,26 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     }
     case WM_COMMAND: {
         int id = LOWORD(wParam), notification = HIWORD(wParam);
-        if (id == ID_ADD_SUBSCRIPTION) beginDownload(windowText(app.url), L"");
+        if (id == ID_TRAY_OPEN) {
+            restoreWindow();
+        } else if (id == ID_TRAY_TOGGLE) {
+            SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(ID_CONNECT, BN_CLICKED), 0);
+        } else if (id == ID_TRAY_EXIT) {
+            app.exiting = true;
+            saveListenerFields();
+            DestroyWindow(hwnd);
+        } else if (id == ID_AUTOSTART) {
+            std::wstring error;
+            bool requested = !app.autostartEnabled;
+            if (setAutostartEnabled(requested, error)) {
+                app.autostartEnabled = requested; updateAutostartButton();
+                std::wstring state = requested ? L"Автозагрузка включена" : L"Автозагрузка выключена";
+                showBanner(state); appendLog(state);
+            } else {
+                showBanner(error.empty() ? L"Не удалось изменить автозагрузку" : error, true);
+                appendLog(L"Ошибка автозагрузки: " + error);
+            }
+        } else if (id == ID_ADD_SUBSCRIPTION) beginDownload(windowText(app.url), L"");
         else if (id == ID_REFRESH_PROCESSES) refreshRunningProcesses();
         else if (id == ID_ADD_PROCESS || (id == ID_RUNNING_PROCESSES && notification == LBN_DBLCLK)) addSelectedProcess();
         else if (id == ID_REMOVE_PROCESS || (id == ID_SELECTED_PROCESSES && notification == LBN_DBLCLK)) removeSelectedProcess();
@@ -518,11 +620,11 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 size_t index = static_cast<size_t>(SendMessageW(app.profiles, LB_GETITEMDATA, selected, 0));
                 app.model.selectedProfileId = app.model.profiles[index].id; app.model.save(); SetWindowTextW(app.status, app.model.profiles[index].name.c_str());
                 if (app.session) {
-                    app.processFilter.reset(); app.socks.reset(); app.session.reset(); SetWindowTextW(app.connect, L"Подключить");
+                    app.session->stop(); app.processFilter.reset(); app.socks.reset(); app.session.reset(); SetWindowTextW(app.connect, L"Подключить");
+                    updateTrayIcon();
                     appendLog(L"Старый туннель остановлен при смене сервера");
                     const auto& uri = app.model.profiles[index].uri;
-                    if (uri.rfind(L"hysteria2://", 0) == 0 || uri.rfind(L"hy2://", 0) == 0) beginConnect(uri);
-                    else showBanner(L"Новый профиль не Hysteria2; туннель отключён", true);
+                    beginConnect(uri);
                 }
             }
         } else if (id == ID_GROUPS && notification == CBN_SELCHANGE) {
@@ -531,20 +633,19 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             saveListenerFields();
             if (app.session) {
                 SetWindowTextW(app.connect, L"Отключение…"); EnableWindow(app.connect, FALSE);
+                app.session->stop();
                 app.processFilter.reset();
                 app.socks.reset();
                 app.session.reset();
+                updateTrayIcon();
                 updateFilterStatus();
                 SetWindowTextW(app.connect, L"Подключить"); EnableWindow(app.connect, TRUE);
-                showBanner(L"Hysteria2 отключена"); appendLog(L"Соединение остановлено");
+                showBanner(L"VPN отключён"); appendLog(L"Соединение остановлено");
                 return 0;
             }
             auto selected = std::find_if(app.model.profiles.begin(), app.model.profiles.end(), [&](const auto& item) { return item.id == app.model.selectedProfileId; });
             if (selected == app.model.profiles.end()) {
-                showBanner(L"Сначала выберите Hysteria2-сервер", true);
-            } else if (selected->uri.rfind(L"hysteria2://", 0) != 0 && selected->uri.rfind(L"hy2://", 0) != 0) {
-                showBanner(L"Первая нативная версия подключает только Hysteria2", true);
-                appendLog(L"Профиль пропущен: VLESS будет добавлен после Hysteria2");
+                showBanner(L"Сначала выберите сервер", true);
             } else {
                 beginConnect(selected->uri);
             }
@@ -597,31 +698,49 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             }
             updateFilterStatus();
             SetWindowTextW(app.connect, L"Отключить");
+            updateTrayIcon();
             std::wstring ready = L"SOCKS5 работает на " + app.model.listenAddress + L":" + std::to_wstring(app.model.listenPort);
-            if (app.processFilter) ready += L"; фильтр TCP+UDP (IPv4/IPv6): " + std::to_wstring(app.model.filteredProcesses.size()) + L" процесс(ов) — перезапустите их";
+            if (app.processFilter) ready += app.session->supportsUdp()
+                ? L"; фильтр TCP+UDP (IPv4/IPv6): " + std::to_wstring(app.model.filteredProcesses.size()) + L" процесс(ов) — перезапустите их"
+                : L"; фильтр TCP (IPv4/IPv6): " + std::to_wstring(app.model.filteredProcesses.size()) + L" процесс(ов) — VLESS UDP пока не включён";
             showBanner(ready); appendLog(payload->result.message); appendLog(ready);
         } else {
             SetWindowTextW(app.connect, L"Подключить");
-            showBanner(payload->result.message.empty() ? L"Hysteria2 не подключилась" : payload->result.message, true);
+            updateTrayIcon();
+            showBanner(payload->result.message.empty() ? L"VPN не подключился" : payload->result.message, true);
             appendLog(L"Ошибка подключения: " + payload->result.message);
         }
         return 0;
     }
-    case WM_CLOSE: saveListenerFields(); DestroyWindow(hwnd); return 0;
+    case WM_CLOSE:
+        saveListenerFields();
+        if (!app.exiting && app.trayAdded) {
+            ShowWindow(hwnd, SW_HIDE);
+            return 0;
+        }
+        DestroyWindow(hwnd);
+        return 0;
     case WM_DESTROY:
         KillTimer(hwnd, FILTER_STATUS_TIMER);
+        removeTrayIcon();
+        if (app.session) app.session->stop();
         app.processFilter.reset();
         app.socks.reset();
         app.session.reset();
-        DeleteObject(app.regular); DeleteObject(app.medium); DeleteObject(app.small); DeleteObject(app.title); DeleteObject(app.background); DeleteObject(app.sidebar); DeleteObject(app.card); DeleteObject(app.input);
+        DeleteObject(app.regular); DeleteObject(app.medium); DeleteObject(app.small); DeleteObject(app.title); DeleteObject(app.background); DeleteObject(app.card); DeleteObject(app.input);
         if (app.fontResource) RemoveFontMemResourceEx(app.fontResource);
         PostQuitMessage(0); return 0;
+    }
+    if (taskbarCreatedMessage && message == taskbarCreatedMessage) {
+        app.trayAdded = false;
+        updateTrayIcon();
+        return 0;
     }
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 }
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int show) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES}; InitCommonControlsEx(&controls);
     WNDCLASSEXW cls{};
@@ -630,12 +749,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     cls.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1)); cls.hIconSm = cls.hIcon;
     cls.hCursor = LoadCursorW(nullptr, IDC_ARROW); cls.hbrBackground = nullptr; cls.lpszClassName = L"BigHeadVPNNativeWindow";
     if (!RegisterClassExW(&cls)) return 1;
+    taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
     BOOL dark = TRUE;
     HWND window = CreateWindowExW(0, cls.lpszClassName, L"Big Head VPN", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 1180, 760, nullptr, nullptr, instance, nullptr);
     if (!window) return 2;
     DwmSetWindowAttribute(window, 20, &dark, sizeof(dark));
-    ShowWindow(window, show); UpdateWindow(window);
+    bool startedAutomatically = commandLine && wcsstr(commandLine, L"--autostart");
+    ShowWindow(window, startedAutomatically ? SW_HIDE : show); UpdateWindow(window);
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) { TranslateMessage(&message); DispatchMessageW(&message); }
     return static_cast<int>(message.wParam);

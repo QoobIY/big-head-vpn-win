@@ -3,14 +3,14 @@
 #include <memory>
 #include <string>
 
-class HysteriaClient;
+class TunnelClient;
 
 class SocksServer {
 public:
     static std::unique_ptr<SocksServer> start(
         const std::wstring& address,
         unsigned short port,
-        HysteriaClient& client,
+        TunnelClient& client,
         std::wstring& error);
 
     ~SocksServer();

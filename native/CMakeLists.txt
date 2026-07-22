@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 project(BigHeadVPNNative LANGUAGES C CXX RC)
 
 set(LSQPACK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.build-tools/ls-qpack")
+set(NGHTTP2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.build-tools/nghttp2")
 add_library(lsqpack STATIC
     "${LSQPACK_DIR}/lsqpack.c"
     "${LSQPACK_DIR}/deps/xxhash/xxhash.c"
@@ -11,14 +12,25 @@ target_include_directories(lsqpack PRIVATE "${LSQPACK_DIR}/deps/xxhash")
 target_compile_definitions(lsqpack PRIVATE LS_QPACK_USE_LARGE_TABLES=0)
 target_compile_options(lsqpack PRIVATE -Os -w -ffunction-sections -fdata-sections)
 
+file(GLOB NGHTTP2_SOURCES "${NGHTTP2_DIR}/lib/*.c")
+add_library(nghttp2_static STATIC ${NGHTTP2_SOURCES})
+target_include_directories(nghttp2_static PUBLIC "${NGHTTP2_DIR}/lib/includes")
+target_include_directories(nghttp2_static PRIVATE "${NGHTTP2_DIR}/lib")
+target_compile_definitions(nghttp2_static PUBLIC NGHTTP2_STATICLIB)
+target_compile_options(nghttp2_static PRIVATE -Os -w -ffunction-sections -fdata-sections)
+
 add_executable(BigHeadVPN WIN32
     src/main.cpp
     src/model.cpp
     src/subscription.cpp
+    src/tunnel_client.cpp
     src/quic_runtime.cpp
     src/hysteria_client.cpp
+    src/vless_client.cpp
+    src/schannel_tls.cpp
     src/socks_server.cpp
     src/process_filter.cpp
+    src/autostart.cpp
     resources/app.rc
 )
 
@@ -42,12 +54,17 @@ target_link_options(BigHeadVPN PRIVATE
     -Wl,--gc-sections -Wl,--strip-all
 )
 target_link_libraries(BigHeadVPN PRIVATE
-    lsqpack bcrypt comctl32 crypt32 dwmapi iphlpapi shlwapi uxtheme winhttp ws2_32
+    lsqpack nghttp2_static advapi32 bcrypt comctl32 crypt32 dwmapi iphlpapi oleaut32 secur32 shell32 shlwapi taskschd uxtheme winhttp ws2_32
 )
 
 add_executable(BigHeadVPNProbe
     tests/hysteria_probe.cpp
+    src/autostart.cpp
+    src/tunnel_client.cpp
     src/hysteria_client.cpp
+    src/vless_client.cpp
+    src/schannel_tls.cpp
+    src/http2_connection.cpp
     src/socks_server.cpp
     src/process_filter.cpp
 )
@@ -61,4 +78,4 @@ target_include_directories(BigHeadVPNProbe SYSTEM PRIVATE
 )
 target_include_directories(BigHeadVPNProbe PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_options(BigHeadVPNProbe PRIVATE -municode -static -static-libgcc -static-libstdc++ -Wl,--gc-sections -Wl,--strip-all)
-target_link_libraries(BigHeadVPNProbe PRIVATE lsqpack bcrypt iphlpapi ws2_32)
+target_link_libraries(BigHeadVPNProbe PRIVATE lsqpack nghttp2_static advapi32 bcrypt iphlpapi oleaut32 secur32 taskschd winhttp ws2_32)
