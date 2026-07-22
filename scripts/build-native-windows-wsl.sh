@@ -97,6 +97,7 @@ cp "$WINDIVERT_DIR/WinDivert.dll" "$DIST_DIR/WinDivert.dll"
 cp "$WINDIVERT_DIR/WinDivert64.sys" "$DIST_DIR/WinDivert64.sys"
 cp "$WINDIVERT_DIR/LICENSE" "$DIST_DIR/WINDIVERT_LICENSE.txt"
 cp "$PROJECT_DIR/native/resources/MANROPE_OFL.txt" "$DIST_DIR/MANROPE_LICENSE.txt"
+cp "$PROJECT_DIR/native/README_USER.md" "$DIST_DIR/README.md"
 
 echo
 echo "Готово: $DIST_DIR/BigHeadVPN.exe"

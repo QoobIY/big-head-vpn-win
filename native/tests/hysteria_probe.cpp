@@ -94,22 +94,25 @@ int wmain(int argc, wchar_t** argv) {
         if (!server) { std::cout << "listen_failed " << utf8(error) << std::endl; return 1; }
         std::cout << "socks_ready" << std::endl;
         if (stopTest) {
-            std::this_thread::sleep_for(std::chrono::seconds(8));
+            std::this_thread::sleep_for(std::chrono::seconds(15));
             auto before = std::chrono::steady_clock::now();
             client->stop();
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - before).count();
             std::cout << "vless_stop_ms=" << elapsed << std::endl;
-        } else std::this_thread::sleep_for(std::chrono::seconds(30));
+        } else std::this_thread::sleep_for(std::chrono::seconds(120));
         return 0;
     }
-    if (argc == 5 && std::wstring_view(argv[1]) == L"--h2-get") {
+    if ((argc == 5 && std::wstring_view(argv[1]) == L"--h2-get") ||
+        (argc == 6 && std::wstring_view(argv[1]) == L"--h2-idle-get")) {
+        bool idle = std::wstring_view(argv[1]) == L"--h2-idle-get";
         WSADATA winsock{};
         if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) return 1;
         Http2Connection http;
         std::wstring error;
         std::string authority = utf8(argv[2]);
         bool connected = http.connect(argv[2], static_cast<unsigned short>(_wtoi(argv[3])), authority, error);
+        if (connected && idle) std::this_thread::sleep_for(std::chrono::seconds(_wtoi(argv[5])));
         int32_t stream = connected ? http.open(utf8(argv[4]), {{"accept", "*/*"}}, {}, {}, error) : -1;
         unsigned status{};
         bool answered = stream >= 0 && http.waitHeaders(stream, status, error, 5000);

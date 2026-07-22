@@ -6,7 +6,9 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <mutex>
 #include <thread>
@@ -31,6 +33,16 @@ bool sendAll(SOCKET socket, const void* input, int length) {
         cursor += count; length -= count;
     }
     return true;
+}
+
+bool receiveHttpHeaders(SOCKET socket, std::string& headers) {
+    std::array<char, 2048> buffer{};
+    while (headers.find("\r\n\r\n") == std::string::npos && headers.size() < 16384) {
+        int count = recv(socket, buffer.data(), static_cast<int>(buffer.size()), 0);
+        if (count <= 0) return false;
+        headers.append(buffer.data(), static_cast<size_t>(count));
+    }
+    return headers.find("\r\n\r\n") != std::string::npos;
 }
 
 std::string utf8(const std::wstring& value) {
@@ -90,7 +102,9 @@ struct SocksServer::Impl {
 
     void serve(SOCKET socket) {
         unsigned char hello[2]{};
-        if (!receiveAll(socket, hello, 2) || hello[0] != 5 || hello[1] == 0) return closeClient(socket);
+        if (!receiveAll(socket, hello, 2)) return closeClient(socket);
+        if (hello[0] != 5) return serveHttpConnect(socket, hello);
+        if (hello[1] == 0) return closeClient(socket);
         std::vector<unsigned char> methods(hello[1]);
         if (!receiveAll(socket, methods.data(), static_cast<int>(methods.size())) || std::find(methods.begin(), methods.end(), 0) == methods.end()) {
             const unsigned char reject[]{5, 0xff}; sendAll(socket, reject, sizeof(reject)); return closeClient(socket);
@@ -120,6 +134,28 @@ struct SocksServer::Impl {
 #endif
             rejectRequest(socket, 5); return;
         }
+        closeClient(socket);
+    }
+
+    void serveHttpConnect(SOCKET socket, const unsigned char first[2]) {
+        std::string headers(reinterpret_cast<const char*>(first), 2);
+        if (!receiveHttpHeaders(socket, headers)) return closeClient(socket);
+        size_t lineEnd = headers.find("\r\n");
+        std::string line = headers.substr(0, lineEnd);
+        size_t firstSpace = line.find(' ');
+        size_t secondSpace = firstSpace == std::string::npos ? firstSpace : line.find(' ', firstSpace + 1);
+        std::string method = firstSpace == std::string::npos ? line : line.substr(0, firstSpace);
+        std::transform(method.begin(), method.end(), method.begin(), [](unsigned char value) { return static_cast<char>(std::toupper(value)); });
+        if (method != "CONNECT" || firstSpace == std::string::npos || secondSpace == std::string::npos || secondSpace == firstSpace + 1) {
+            static constexpr char rejected[] = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            sendAll(socket, rejected, static_cast<int>(sizeof(rejected) - 1));
+            return closeClient(socket);
+        }
+        std::string destination = line.substr(firstSpace + 1, secondSpace - firstSpace - 1);
+        static constexpr char established[] = "HTTP/1.1 200 Connection Established\r\nProxy-Agent: BigHeadVPN\r\n\r\n";
+        if (!sendAll(socket, established, static_cast<int>(sizeof(established) - 1))) return closeClient(socket);
+        std::wstring error;
+        client->relayTcp(destination, static_cast<std::uintptr_t>(socket), error, false);
         closeClient(socket);
     }
 

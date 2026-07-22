@@ -58,11 +58,12 @@ bool SchannelTls::connect(const std::wstring& host, unsigned short port, std::ws
         setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
         setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
         if (::connect(socket_, address->ai_addr, static_cast<int>(address->ai_addrlen)) == 0) break;
+        resolved = WSAGetLastError();
         closesocket(socket_);
         socket_ = INVALID_SOCKET;
     }
     FreeAddrInfoW(addresses);
-    if (socket_ == INVALID_SOCKET) { error = socketError(L"TLS: сервер недоступен"); return false; }
+    if (socket_ == INVALID_SOCKET) { error = socketError(L"TLS: сервер недоступен", resolved); return false; }
 
     SCHANNEL_CRED credentials{};
     credentials.dwVersion = SCHANNEL_CRED_VERSION;
@@ -142,6 +143,14 @@ bool SchannelTls::connect(const std::wstring& host, unsigned short port, std::ws
     }
     status = QueryContextAttributesW(&context_, SECPKG_ATTR_STREAM_SIZES, &sizes_);
     if (status != SEC_E_OK) { error = securityError(L"TLS: параметры потока недоступны", status); close(); return false; }
+    // The 15-second receive timeout is only for the TLS handshake. Leaving
+    // it on a persistent HTTP/2 socket kills healthy long-lived responses
+    // whenever Codex/Discord has no downlink bytes for 15 seconds.
+    DWORD blockingReceive = 0;
+    setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO,
+        reinterpret_cast<const char*>(&blockingReceive), sizeof(blockingReceive));
+    setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO,
+        reinterpret_cast<const char*>(&blockingReceive), sizeof(blockingReceive));
     return true;
 }
 

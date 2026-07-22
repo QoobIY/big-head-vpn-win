@@ -17,6 +17,7 @@ public:
     bool sendUdp(uint32_t, const std::string&, const unsigned char*, size_t,
         std::wstring& error) override;
     void setUdpReceiveHandler(UdpReceiveHandler) override;
+    void setErrorHandler(ErrorHandler) override;
     std::wstring udpDiagnostics() const override;
     bool supportsUdp() const override { return true; }
 

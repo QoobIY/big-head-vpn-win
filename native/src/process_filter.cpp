@@ -65,6 +65,7 @@ struct UdpState {
     uint32_t remoteAddress{}, localAddress{};
     uint16_t remotePort{}, localPort{};
     DWORD interfaceIndex{};
+    uint64_t startedTick{}, responseTick{};
 };
 struct Nat6State {
     uint16_t remotePort{};
@@ -77,7 +78,17 @@ struct Udp6State {
     std::array<uint32_t, 4> remoteAddress{}, localAddress{};
     uint16_t remotePort{}, localPort{};
     DWORD interfaceIndex{};
+    uint64_t startedTick{}, responseTick{};
 };
+struct PendingObservation {
+    uint64_t firstTick{};
+    unsigned packets{};
+};
+
+void updateMaximum(std::atomic_ullong& target, unsigned long long value) {
+    unsigned long long current = target.load();
+    while (current < value && !target.compare_exchange_weak(current, value)) {}
+}
 
 std::wstring lower(std::wstring value) {
     std::transform(value.begin(), value.end(), value.begin(), towlower);
@@ -194,6 +205,7 @@ struct ProcessFilter::Impl {
     std::vector<std::wstring> names;
     std::atomic_bool stopping{};
     std::atomic_ullong matched{}, redirected{}, proxyReplies{}, accepted{}, acceptAttempts{}, natMisses{}, udpMatched{}, udpSent{}, udpReceived{}, socketEventCount{}, namedProcessCount{}, injectionFailureCount{};
+    std::atomic_ullong tcpLate{}, tcpLateMax{}, udpLate{}, udpLatePacketCount{}, udpLateMax{}, udpResponseLast{}, udpResponseMax{};
     std::atomic_ulong injectionError{};
     std::atomic_uint32_t nextUdpSession{1};
     std::thread socketThread, flowThread, networkThread, acceptThread, acceptThread6;
@@ -208,6 +220,8 @@ struct ProcessFilter::Impl {
     std::unordered_map<uint32_t, UdpState> udpBySession;
     std::unordered_map<Flow6Key, Udp6State, Flow6Hash> udpSessions6;
     std::unordered_map<uint32_t, Udp6State> udp6BySession;
+    std::unordered_map<FlowKey, PendingObservation, FlowHash> pendingTcp, pendingUdp;
+    std::unordered_map<Flow6Key, PendingObservation, Flow6Hash> pendingTcp6, pendingUdp6;
     std::vector<std::thread> workers;
     std::vector<SOCKET> clients;
 
@@ -289,6 +303,29 @@ struct ProcessFilter::Impl {
         return {address[0], address[1], address[2], address[3]};
     }
 
+    template<class Map>
+    void rememberPending(Map& values, const typename Map::key_type& key) {
+        uint64_t now = GetTickCount64();
+        auto [found, inserted] = values.try_emplace(key, PendingObservation{now, 0});
+        ++found->second.packets;
+        if (values.size() > 2048) {
+            std::erase_if(values, [&](const auto& item) { return now - item.second.firstTick > 5000; });
+        }
+    }
+
+    template<class Map>
+    void resolvePending(Map& values, const typename Map::key_type& key, bool selectedFlow,
+        std::atomic_ullong& flows, std::atomic_ullong* packets, std::atomic_ullong& maximum) {
+        auto found = values.find(key);
+        if (found == values.end()) return;
+        if (selectedFlow) {
+            ++flows;
+            if (packets) *packets += found->second.packets;
+            updateMaximum(maximum, GetTickCount64() - found->second.firstTick);
+        }
+        values.erase(found);
+    }
+
     void socketLoop() {
         WINDIVERT_ADDRESS address{};
         while (!stopping && receive(socketHandle, nullptr, 0, nullptr, &address)) {
@@ -299,7 +336,8 @@ struct ProcessFilter::Impl {
                 Flow6Key key{address6(address.Socket.RemoteAddr), address.Socket.LocalPort, address.Socket.RemotePort};
                 std::lock_guard lock(mutex);
                 if (address.Event == WINDIVERT_EVENT_SOCKET_CONNECT) {
-                    bool matches = selected(address.Socket.ProcessId); selectedFlows6[key] = {matches, address.Socket.EndpointId}; if (matches) ++matched;
+                    bool matches = selected(address.Socket.ProcessId); resolvePending(pendingTcp6, key, matches, tcpLate, nullptr, tcpLateMax);
+                    selectedFlows6[key] = {matches, address.Socket.EndpointId}; if (matches) ++matched;
                 } else {
                     auto flow = selectedFlows6.find(key);
                     if (flow != selectedFlows6.end() && flow->second.endpoint == address.Socket.EndpointId) { selectedFlows6.erase(flow); nat6.erase(key); }
@@ -309,7 +347,8 @@ struct ProcessFilter::Impl {
             FlowKey key{remote, address.Socket.LocalPort, address.Socket.RemotePort};
             std::lock_guard lock(mutex);
             if (address.Event == WINDIVERT_EVENT_SOCKET_CONNECT) {
-                bool matches = selected(address.Socket.ProcessId); selectedFlows[key] = {matches, address.Socket.EndpointId}; if (matches) ++matched;
+                bool matches = selected(address.Socket.ProcessId); resolvePending(pendingTcp, key, matches, tcpLate, nullptr, tcpLateMax);
+                selectedFlows[key] = {matches, address.Socket.EndpointId}; if (matches) ++matched;
             }
             else if (address.Event == WINDIVERT_EVENT_SOCKET_CLOSE) {
                 auto flow = selectedFlows.find(key);
@@ -331,7 +370,8 @@ struct ProcessFilter::Impl {
                 Flow6Key key{address6(address.Flow.RemoteAddr), address.Flow.LocalPort, address.Flow.RemotePort};
                 std::lock_guard lock(mutex);
                 if (address.Event == WINDIVERT_EVENT_FLOW_ESTABLISHED) {
-                    bool matches = selected(address.Flow.ProcessId); selectedUdpFlows6[key] = {matches, address.Flow.EndpointId}; if (matches) ++udpMatched;
+                    bool matches = selected(address.Flow.ProcessId); resolvePending(pendingUdp6, key, matches, udpLate, &udpLatePacketCount, udpLateMax);
+                    selectedUdpFlows6[key] = {matches, address.Flow.EndpointId}; if (matches) ++udpMatched;
                 } else if (address.Event == WINDIVERT_EVENT_FLOW_DELETED) {
                     auto flow = selectedUdpFlows6.find(key);
                     if (flow != selectedUdpFlows6.end() && flow->second.endpoint == address.Flow.EndpointId) {
@@ -344,7 +384,8 @@ struct ProcessFilter::Impl {
             FlowKey key{remote, address.Flow.LocalPort, address.Flow.RemotePort};
             std::lock_guard lock(mutex);
             if (address.Event == WINDIVERT_EVENT_FLOW_ESTABLISHED) {
-                bool matches = selected(address.Flow.ProcessId); selectedUdpFlows[key] = {matches, address.Flow.EndpointId}; if (matches) ++udpMatched;
+                bool matches = selected(address.Flow.ProcessId); resolvePending(pendingUdp, key, matches, udpLate, &udpLatePacketCount, udpLateMax);
+                selectedUdpFlows[key] = {matches, address.Flow.EndpointId}; if (matches) ++udpMatched;
             } else if (address.Event == WINDIVERT_EVENT_FLOW_DELETED) {
                 auto flow = selectedUdpFlows.find(key);
                 if (flow != selectedUdpFlows.end() && flow->second.endpoint == address.Flow.EndpointId) {
@@ -367,11 +408,13 @@ struct ProcessFilter::Impl {
                 Udp6State state{}; bool divert = false;
                 {
                     std::lock_guard lock(mutex); auto flow = selectedUdpFlows6.find(key); divert = flow != selectedUdpFlows6.end() && flow->second.selected;
+                    if (flow == selectedUdpFlows6.end()) rememberPending(pendingUdp6, key);
                     if (divert) {
                         auto found = udpSessions6.find(key);
                         if (found == udpSessions6.end()) {
                             state.session = nextUdpSession.fetch_add(2); state.remoteAddress = address6(ip6->DstAddr); state.localAddress = address6(ip6->SrcAddr);
                             state.remotePort = key.remotePort; state.localPort = key.localPort; state.interfaceIndex = address.Network.IfIdx;
+                            state.startedTick = GetTickCount64();
                             if (!state.interfaceIndex) { sockaddr_in6 destination{}; destination.sin6_family = AF_INET6; std::memcpy(&destination.sin6_addr, ip6->DstAddr, 16); GetBestInterfaceEx(reinterpret_cast<sockaddr*>(&destination), &state.interfaceIndex); }
                             udpSessions6.emplace(key, state); udp6BySession.emplace(state.session, state);
                         } else state = found->second;
@@ -391,12 +434,14 @@ struct ProcessFilter::Impl {
                 {
                     std::lock_guard lock(mutex);
                     auto flow = selectedUdpFlows.find(key); divert = flow != selectedUdpFlows.end() && flow->second.selected;
+                    if (flow == selectedUdpFlows.end()) rememberPending(pendingUdp, key);
                     if (divert) {
                         auto found = udpSessions.find(key);
                         if (found == udpSessions.end()) {
                             DWORD interfaceIndex = address.Network.IfIdx;
                             if (!interfaceIndex) { sockaddr_in destination{}; destination.sin_family = AF_INET; destination.sin_addr.s_addr = ip->DstAddr; GetBestInterfaceEx(reinterpret_cast<sockaddr*>(&destination), &interfaceIndex); }
                             state = {nextUdpSession.fetch_add(2), ip->DstAddr, ip->SrcAddr, key.remotePort, key.localPort, interfaceIndex};
+                            state.startedTick = GetTickCount64();
                             udpSessions.emplace(key, state); udpBySession.emplace(state.session, state);
                         } else state = found->second;
                     }
@@ -423,7 +468,8 @@ struct ProcessFilter::Impl {
                 } else if (!address.Loopback) {
                     Flow6Key key{address6(ip6->DstAddr), ntohs(tcp->SrcPort), ntohs(tcp->DstPort)};
                     bool divert = false; UINT64 endpoint = 0;
-                    { std::lock_guard lock(mutex); auto found = selectedFlows6.find(key); if (found != selectedFlows6.end()) { divert = found->second.selected; endpoint = found->second.endpoint; } }
+                    { std::lock_guard lock(mutex); auto found = selectedFlows6.find(key); if (found != selectedFlows6.end()) { divert = found->second.selected; endpoint = found->second.endpoint; }
+                      else if (tcp->Syn && !tcp->Ack) rememberPending(pendingTcp6, key); }
                     if (divert) {
                         ++redirected; Nat6State state{}; state.remotePort = key.remotePort; state.endpoint = endpoint;
                         state.remoteAddress = address6(ip6->DstAddr); state.localAddress = address6(ip6->SrcAddr); state.interfaceIndex = address.Network.IfIdx;
@@ -457,7 +503,8 @@ struct ProcessFilter::Impl {
             } else if (!address.Loopback) {
                 FlowKey key{ip->DstAddr, ntohs(tcp->SrcPort), ntohs(tcp->DstPort)};
                 bool divert = false; UINT64 endpoint = 0;
-                { std::lock_guard lock(mutex); auto found = selectedFlows.find(key); if (found != selectedFlows.end()) { divert = found->second.selected; endpoint = found->second.endpoint; } }
+                { std::lock_guard lock(mutex); auto found = selectedFlows.find(key); if (found != selectedFlows.end()) { divert = found->second.selected; endpoint = found->second.endpoint; }
+                  else if (tcp->Syn && !tcp->Ack) rememberPending(pendingTcp, key); }
                 if (divert) {
                     ++redirected;
                     uint32_t remoteAddress = ip->DstAddr, localAddress = ip->SrcAddr;
@@ -482,8 +529,20 @@ struct ProcessFilter::Impl {
         if (stopping || payload.size() > 65507) return;
         UdpState state{};
         Udp6State state6{}; bool ipv6 = false;
-        { std::lock_guard lock(mutex); auto found = udpBySession.find(session); if (found != udpBySession.end()) state = found->second;
-          else { auto found6 = udp6BySession.find(session); if (found6 == udp6BySession.end()) return; state6 = found6->second; ipv6 = true; } }
+        { std::lock_guard lock(mutex); auto found = udpBySession.find(session); if (found != udpBySession.end()) {
+              if (!found->second.responseTick) {
+                  found->second.responseTick = GetTickCount64();
+                  unsigned long long delay = found->second.responseTick - found->second.startedTick;
+                  udpResponseLast = delay; updateMaximum(udpResponseMax, delay);
+              }
+              state = found->second;
+          } else { auto found6 = udp6BySession.find(session); if (found6 == udp6BySession.end()) return;
+              if (!found6->second.responseTick) {
+                  found6->second.responseTick = GetTickCount64();
+                  unsigned long long delay = found6->second.responseTick - found6->second.startedTick;
+                  udpResponseLast = delay; updateMaximum(udpResponseMax, delay);
+              }
+              state6 = found6->second; ipv6 = true; } }
         if (ipv6) { injectUdp6(state6, std::move(payload)); return; }
         std::vector<unsigned char> packet(sizeof(WINDIVERT_IPHDR) + sizeof(WINDIVERT_UDPHDR) + payload.size());
         auto* ip = reinterpret_cast<PWINDIVERT_IPHDR>(packet.data());
@@ -580,6 +639,13 @@ unsigned long long ProcessFilter::natMisses() const { return implementation_ ? i
 unsigned long long ProcessFilter::udpMatchedFlows() const { return implementation_ ? implementation_->udpMatched.load() : 0; }
 unsigned long long ProcessFilter::udpSentPackets() const { return implementation_ ? implementation_->udpSent.load() : 0; }
 unsigned long long ProcessFilter::udpReceivedPackets() const { return implementation_ ? implementation_->udpReceived.load() : 0; }
+unsigned long long ProcessFilter::tcpLateFlows() const { return implementation_ ? implementation_->tcpLate.load() : 0; }
+unsigned long long ProcessFilter::tcpLateMaxMs() const { return implementation_ ? implementation_->tcpLateMax.load() : 0; }
+unsigned long long ProcessFilter::udpLateFlows() const { return implementation_ ? implementation_->udpLate.load() : 0; }
+unsigned long long ProcessFilter::udpLatePackets() const { return implementation_ ? implementation_->udpLatePacketCount.load() : 0; }
+unsigned long long ProcessFilter::udpLateMaxMs() const { return implementation_ ? implementation_->udpLateMax.load() : 0; }
+unsigned long long ProcessFilter::udpResponseLastMs() const { return implementation_ ? implementation_->udpResponseLast.load() : 0; }
+unsigned long long ProcessFilter::udpResponseMaxMs() const { return implementation_ ? implementation_->udpResponseMax.load() : 0; }
 unsigned long long ProcessFilter::socketEvents() const { return implementation_ ? implementation_->socketEventCount.load() : 0; }
 unsigned long long ProcessFilter::namedProcesses() const { return implementation_ ? implementation_->namedProcessCount.load() : 0; }
 unsigned long long ProcessFilter::injectionFailures() const { return implementation_ ? implementation_->injectionFailureCount.load() : 0; }

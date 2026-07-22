@@ -310,7 +310,11 @@ struct HysteriaClient::Impl {
     std::atomic_uint64_t udpQueued{}, udpSent{}, udpAcknowledged{}, udpLost{}, udpCanceled{}, udpRawReceived{};
     std::mutex udpMutex;
     UdpReceiveHandler udpHandler;
+    ErrorHandler errorHandler;
     std::unordered_map<uint64_t, UdpFragments> udpFragments;
+    std::atomic_bool stopping{};
+    std::atomic_bool runtimeFailed{};
+    bool cleaned{};
 
     static struct lsqpack_dec_hset_if decoderCallbacks;
 
@@ -318,13 +322,38 @@ struct HysteriaClient::Impl {
         lsqpack_dec_init(&decoder, nullptr, 0, 0, &decoderCallbacks, static_cast<lsqpack_dec_opts>(0));
     }
 
-    ~Impl() { stop(); lsqpack_dec_cleanup(&decoder); }
+    ~Impl() { stop(); cleanup(); lsqpack_dec_cleanup(&decoder); }
 
     void finish(bool ok, std::wstring text) {
         std::lock_guard lock(mutex);
         if (finished) return;
         finished = true; success = ok; message = std::move(text);
         stateChanged.notify_all();
+    }
+
+    void reportError(const std::wstring& error) {
+        ErrorHandler handler;
+        {
+            std::lock_guard lock(udpMutex);
+            handler = errorHandler;
+        }
+        if (handler && !stopping) handler(error);
+    }
+
+    void failRuntime(std::wstring error) {
+        if (stopping || runtimeFailed.exchange(true)) return;
+        {
+            std::lock_guard lock(mutex);
+            for (auto& stream : streams) {
+                if (stream->kind != StreamKind::Tcp) continue;
+                std::lock_guard streamLock(stream->tcpMutex);
+                stream->tcpFailed = true;
+                stream->tcpError = error;
+                if (stream->socket != INVALID_SOCKET) ::shutdown(stream->socket, SD_BOTH);
+                stream->tcpChanged.notify_all();
+            }
+        }
+        reportError(error);
     }
 
     bool initialize(std::wstring& error) {
@@ -370,6 +399,7 @@ struct HysteriaClient::Impl {
     }
 
     StreamContext* openStream(StreamKind kind, QUIC_STREAM_OPEN_FLAGS flags, std::vector<uint8_t> initial, QUIC_SEND_FLAGS sendFlags) {
+        if (stopping || !api || !connection) return nullptr;
         auto context = std::make_unique<StreamContext>();
         context->owner = this; context->kind = kind;
         if (QUIC_FAILED(api->StreamOpen(connection, flags, streamCallback, context.get(), &context->handle))) return nullptr;
@@ -467,7 +497,13 @@ struct HysteriaClient::Impl {
             socket = stream.socket;
             deliver.assign(data, data + length);
         }
-        if (socket != INVALID_SOCKET && !deliver.empty()) sendSocketAll(socket, deliver.data(), deliver.size());
+        if (socket != INVALID_SOCKET && !deliver.empty() && !sendSocketAll(socket, deliver.data(), deliver.size())) {
+            std::lock_guard lock(stream.tcpMutex);
+            stream.tcpFailed = true;
+            stream.tcpError = L"Локальное приложение закрыло TCP-соединение";
+            if (stream.socket != INVALID_SOCKET) ::shutdown(stream.socket, SD_BOTH);
+            stream.tcpChanged.notify_all();
+        }
     }
 
     void decodeAuthHeaders(const uint8_t* bytes, size_t length) {
@@ -526,11 +562,19 @@ struct HysteriaClient::Impl {
                 delete static_cast<OwnedDatagram*>(event->DATAGRAM_SEND_STATE_CHANGED.ClientContext);
             break;
         }
-        case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
-            self.finish(false, transportError(event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status)); break;
+        case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT: {
+            std::wstring error = transportError(event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status);
+            self.finish(false, error);
+            self.failRuntime(std::move(error));
+            break;
+        }
         case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER:
             self.peerCloseCode = event->SHUTDOWN_INITIATED_BY_PEER.ErrorCode;
-            if (self.peerCloseCode != 0x100) self.finish(false, L"Сервер Hysteria2 закрыл соединение, H3 код " + std::to_wstring(self.peerCloseCode));
+            if (!self.stopping) {
+                std::wstring error = L"Сервер Hysteria2 закрыл соединение, H3 код " + std::to_wstring(self.peerCloseCode);
+                self.finish(false, error);
+                self.failRuntime(std::move(error));
+            }
             break;
         case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE: {
             bool reportGracefulClose = false;
@@ -592,6 +636,7 @@ struct HysteriaClient::Impl {
     }
 
     bool sendUdp(uint32_t session, const std::string& destination, const uint8_t* data, size_t length, std::wstring& error) {
+        if (stopping) { error = L"Hysteria2 остановлена"; return false; }
         if (!udpEnabled) { error = L"Hysteria2-сервер отключил UDP"; return false; }
         if (!datagramSendEnabled.load()) {
             std::unique_lock lock(mutex);
@@ -645,7 +690,17 @@ struct HysteriaClient::Impl {
         switch (event->Type) {
         case QUIC_STREAM_EVENT_START_COMPLETE:
             if (QUIC_SUCCEEDED(event->START_COMPLETE.Status)) ++self.completedStarts;
-            else self.finish(false, L"Не удалось запустить HTTP/3 stream, код " + std::to_wstring(event->START_COMPLETE.Status));
+            else if (stream.kind == StreamKind::Tcp) {
+                std::wstring error = L"Не удалось запустить Hysteria2 TCP stream, код " + std::to_wstring(event->START_COMPLETE.Status);
+                {
+                    std::lock_guard lock(stream.tcpMutex);
+                    stream.tcpFailed = true;
+                    stream.tcpError = error;
+                    if (stream.socket != INVALID_SOCKET) ::shutdown(stream.socket, SD_BOTH);
+                    stream.tcpChanged.notify_all();
+                }
+                self.reportError(error);
+            } else self.finish(false, L"Не удалось запустить HTTP/3 stream, код " + std::to_wstring(event->START_COMPLETE.Status));
             break;
         case QUIC_STREAM_EVENT_RECEIVE:
             for (uint32_t i = 0; i < event->RECEIVE.BufferCount; ++i) {
@@ -673,7 +728,9 @@ struct HysteriaClient::Impl {
         case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
             if (stream.kind == StreamKind::Auth) self.finish(false, L"HTTP/3 auth stream прерван сервером");
             else if (stream.kind == StreamKind::Tcp) {
-                std::lock_guard lock(stream.tcpMutex); stream.tcpFailed = true; stream.tcpError = L"TCP stream прерван сервером"; stream.tcpChanged.notify_all();
+                std::lock_guard lock(stream.tcpMutex); stream.tcpFailed = true; stream.tcpError = L"TCP stream прерван сервером";
+                if (stream.socket != INVALID_SOCKET) ::shutdown(stream.socket, SD_BOTH);
+                stream.tcpChanged.notify_all();
             }
             break;
         case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
@@ -689,12 +746,35 @@ struct HysteriaClient::Impl {
     }
 
     void stop() {
+        if (stopping.exchange(true)) return;
+        {
+            std::lock_guard lock(udpMutex);
+            udpHandler = {};
+        }
+        // Wake every external SOCKS/WinDivert relay before releasing any
+        // StreamContext.  The owners are destroyed by the UI immediately
+        // after stop() and can then join their worker threads safely.
+        {
+            std::lock_guard lock(mutex);
+            for (auto& stream : streams) {
+                if (stream->kind != StreamKind::Tcp) continue;
+                std::lock_guard streamLock(stream->tcpMutex);
+                stream->tcpFailed = true;
+                stream->tcpError = L"Hysteria2 остановлена";
+                if (stream->socket != INVALID_SOCKET) ::shutdown(stream->socket, SD_BOTH);
+                stream->tcpChanged.notify_all();
+            }
+        }
         if (connection && api) {
             api->ConnectionShutdown(connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0x100);
             std::unique_lock lock(mutex);
             stateChanged.wait_for(lock, 2s, [&] { return shutdownComplete; });
-            lock.unlock();
         }
+    }
+
+    void cleanup() {
+        if (cleaned) return;
+        cleaned = true;
         if (api) {
             for (auto& stream : streams) if (stream->handle) api->StreamClose(stream->handle);
             streams.clear();
@@ -710,6 +790,7 @@ struct HysteriaClient::Impl {
     }
 
     bool relayTcp(const std::string& destination, SOCKET socket, std::wstring& error, bool socksReply) {
+        if (runtimeFailed) { error = L"Соединение Hysteria2 потеряно — переподключитесь"; return false; }
         std::string padding = randomPadding().substr(0, 64 + (GetTickCount64() % 448));
         std::vector<uint8_t> request;
         appendQuicVarint(request, 0x401);
@@ -742,9 +823,13 @@ struct HysteriaClient::Impl {
         for (;;) {
             int count = ::recv(socket, buffer, sizeof(buffer), 0);
             if (count <= 0) break;
-            if (!send(stream, std::vector<uint8_t>(buffer, buffer + count), QUIC_SEND_FLAG_NONE)) break;
+            if (!send(stream, std::vector<uint8_t>(buffer, buffer + count), QUIC_SEND_FLAG_NONE)) {
+                error = runtimeFailed ? L"Соединение Hysteria2 потеряно — переподключитесь" : L"Не удалось отправить данные в Hysteria2 TCP stream";
+                return false;
+            }
         }
-        api->StreamShutdown(stream->handle, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
+        if (!stopping && api && stream->handle)
+            api->StreamShutdown(stream->handle, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
         {
             std::lock_guard lock(stream->tcpMutex); stream->socket = INVALID_SOCKET;
         }
@@ -776,17 +861,35 @@ void HysteriaClient::stop() {
 }
 
 bool HysteriaClient::relayTcp(const std::string& destination, std::uintptr_t socket, std::wstring& error, bool socksReply) {
-    return implementation_ && implementation_->relayTcp(destination, static_cast<SOCKET>(socket), error, socksReply);
+    bool ok = implementation_ && implementation_->relayTcp(destination, static_cast<SOCKET>(socket), error, socksReply);
+    if (!ok && implementation_) {
+        ErrorHandler handler;
+        { std::lock_guard lock(implementation_->udpMutex); handler = implementation_->errorHandler; }
+        if (handler && !implementation_->stopping) handler(error);
+    }
+    return ok;
 }
 
 bool HysteriaClient::sendUdp(uint32_t sessionId, const std::string& destination, const unsigned char* data, size_t length, std::wstring& error) {
-    return implementation_ && implementation_->sendUdp(sessionId, destination, data, length, error);
+    bool ok = implementation_ && implementation_->sendUdp(sessionId, destination, data, length, error);
+    if (!ok && implementation_) {
+        ErrorHandler handler;
+        { std::lock_guard lock(implementation_->udpMutex); handler = implementation_->errorHandler; }
+        if (handler && !implementation_->stopping) handler(error);
+    }
+    return ok;
 }
 
 void HysteriaClient::setUdpReceiveHandler(UdpReceiveHandler handler) {
     if (!implementation_) return;
     std::lock_guard lock(implementation_->udpMutex);
     implementation_->udpHandler = std::move(handler);
+}
+
+void HysteriaClient::setErrorHandler(ErrorHandler handler) {
+    if (!implementation_) return;
+    std::lock_guard lock(implementation_->udpMutex);
+    implementation_->errorHandler = std::move(handler);
 }
 
 std::wstring HysteriaClient::udpDiagnostics() const {

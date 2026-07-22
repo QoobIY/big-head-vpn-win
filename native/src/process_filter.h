@@ -26,6 +26,13 @@ public:
     unsigned long long udpMatchedFlows() const;
     unsigned long long udpSentPackets() const;
     unsigned long long udpReceivedPackets() const;
+    unsigned long long tcpLateFlows() const;
+    unsigned long long tcpLateMaxMs() const;
+    unsigned long long udpLateFlows() const;
+    unsigned long long udpLatePackets() const;
+    unsigned long long udpLateMaxMs() const;
+    unsigned long long udpResponseLastMs() const;
+    unsigned long long udpResponseMaxMs() const;
     unsigned long long socketEvents() const;
     unsigned long long namedProcesses() const;
     unsigned long long injectionFailures() const;

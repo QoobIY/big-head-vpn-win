@@ -38,6 +38,7 @@ enum ControlId {
 constexpr UINT WM_SUBSCRIPTION_READY = WM_APP + 10;
 constexpr UINT WM_CONNECT_READY = WM_APP + 11;
 constexpr UINT WM_TRAY = WM_APP + 12;
+constexpr UINT WM_TUNNEL_ERROR = WM_APP + 13;
 constexpr UINT_PTR FILTER_STATUS_TIMER = 1;
 constexpr int IDR_MANROPE = 101;
 constexpr UINT TRAY_ICON_ID = 1;
@@ -332,12 +333,22 @@ void updateFilterStatus(bool writeLog) {
     auto udpMatched = app.processFilter->udpMatchedFlows();
     auto udpSent = app.processFilter->udpSentPackets();
     auto udpReceived = app.processFilter->udpReceivedPackets();
+    auto tcpLate = app.processFilter->tcpLateFlows();
+    auto tcpLateMax = app.processFilter->tcpLateMaxMs();
+    auto udpLate = app.processFilter->udpLateFlows();
+    auto udpLatePackets = app.processFilter->udpLatePackets();
+    auto udpLateMax = app.processFilter->udpLateMaxMs();
+    auto udpResponseLast = app.processFilter->udpResponseLastMs();
+    auto udpResponseMax = app.processFilter->udpResponseMaxMs();
     auto injectionFailures = app.processFilter->injectionFailures();
     std::wstring status = L"TCP: соединений " + std::to_wstring(matched) +
-        L"  •  SYN " + std::to_wstring(redirected) + L"/SYN-ACK " + std::to_wstring(proxyReplies) + L"  •  relay " + std::to_wstring(accepted);
+        L"  •  пакетов ↑" + std::to_wstring(redirected) + L"/↓" + std::to_wstring(proxyReplies) + L"  •  relay " + std::to_wstring(accepted);
     if (attempts != accepted) status += L"/" + std::to_wstring(attempts) + L" (NAT miss " + std::to_wstring(natMisses) + L")";
     if (injectionFailures) status += L"  •  send errors " + std::to_wstring(injectionFailures) + L"/" + std::to_wstring(app.processFilter->lastInjectionError());
     status += L"  •  UDP " + std::to_wstring(udpMatched) + L":" + std::to_wstring(udpSent) + L"/" + std::to_wstring(udpReceived);
+    status += L"  •  DIAG late TCP " + std::to_wstring(tcpLate) + L"/" + std::to_wstring(tcpLateMax) + L"ms";
+    status += L" UDP " + std::to_wstring(udpLate) + L":" + std::to_wstring(udpLatePackets) + L"/" + std::to_wstring(udpLateMax) + L"ms";
+    status += L" reply " + std::to_wstring(udpResponseLast) + L"/" + std::to_wstring(udpResponseMax) + L"ms";
     SetWindowTextW(app.filterStatus, status.c_str());
     if (writeLog && (matched != app.lastMatched || redirected != app.lastRedirected || proxyReplies != app.lastProxyReplies || accepted != app.lastAccepted ||
         attempts != app.lastAcceptAttempts || natMisses != app.lastNatMisses || udpMatched != app.lastUdpMatched ||
@@ -423,7 +434,7 @@ void paint(HDC dc, const RECT& client) {
     constexpr wchar_t subtitle[] = L"Лёгкий нативный клиент для Windows";
     TextOutW(dc, 73, 48, subtitle, static_cast<int>(std::size(subtitle) - 1));
     label(dc, margin + 20, 247, L"СЕРВЕРЫ И ПОДПИСКИ");
-    label(dc, rightX + 20, 143, L"ЛОКАЛЬНЫЙ SOCKS5");
+    label(dc, rightX + 20, 143, L"ЛОКАЛЬНЫЙ PROXY: SOCKS5 + HTTP");
     label(dc, rightX + 20, 213, L"ПРОЦЕССЫ ЧЕРЕЗ VPN");
     label(dc, rightX + 20, 258, L"ЗАПУЩЕННЫЕ");
     int processWidth = (right.right - right.left - 50) / 2;
@@ -677,6 +688,12 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         app.connecting = false; EnableWindow(app.connect, TRUE);
         if (payload->session && payload->result.connected) {
             app.session = std::move(payload->session);
+            HWND target = app.window;
+            app.session->setErrorHandler([target](std::wstring error) {
+                auto message = std::make_unique<std::wstring>(std::move(error));
+                if (!PostMessageW(target, WM_TUNNEL_ERROR, 0, reinterpret_cast<LPARAM>(message.get()))) return;
+                message.release();
+            });
             std::wstring listenerError;
             app.socks = SocksServer::start(app.model.listenAddress, app.model.listenPort, *app.session, listenerError);
             if (!app.socks) {
@@ -699,7 +716,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             updateFilterStatus();
             SetWindowTextW(app.connect, L"Отключить");
             updateTrayIcon();
-            std::wstring ready = L"SOCKS5 работает на " + app.model.listenAddress + L":" + std::to_wstring(app.model.listenPort);
+            std::wstring ready = L"SOCKS5 + HTTP CONNECT работают на " + app.model.listenAddress + L":" + std::to_wstring(app.model.listenPort);
             if (app.processFilter) ready += app.session->supportsUdp()
                 ? L"; фильтр TCP+UDP (IPv4/IPv6): " + std::to_wstring(app.model.filteredProcesses.size()) + L" процесс(ов) — перезапустите их"
                 : L"; фильтр TCP (IPv4/IPv6): " + std::to_wstring(app.model.filteredProcesses.size()) + L" процесс(ов) — VLESS UDP пока не включён";
@@ -709,6 +726,14 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             updateTrayIcon();
             showBanner(payload->result.message.empty() ? L"VPN не подключился" : payload->result.message, true);
             appendLog(L"Ошибка подключения: " + payload->result.message);
+        }
+        return 0;
+    }
+    case WM_TUNNEL_ERROR: {
+        std::unique_ptr<std::wstring> error(reinterpret_cast<std::wstring*>(lParam));
+        if (app.session && error && !error->empty()) {
+            showBanner(*error, true);
+            appendLog(L"Ошибка туннеля: " + *error);
         }
         return 0;
     }

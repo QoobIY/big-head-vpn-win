@@ -340,6 +340,7 @@ public:
         fwprintf(stderr, L"h2_connect preface sent\n"); fflush(stderr);
 #endif
         reader_ = std::thread([this] { readLoop(); });
+        keepalive_ = std::thread([this] { keepaliveLoop(); });
         return true;
     }
 
@@ -378,6 +379,21 @@ public:
         return true;
     }
 
+    std::wstring downloadFailure(int streamId) {
+        std::lock_guard lock(mutex_);
+        auto it = streams_.find(streamId);
+        if (it == streams_.end()) return L"VLESS XHTTP: stream-down исчез";
+        it->second->observed = true;
+        return it->second->prematureDownloadClose
+            ? L"VLESS XHTTP: сервер закрыл stream-down без ответа" : std::wstring{};
+    }
+
+    bool streamOpen(int streamId) const {
+        std::lock_guard lock(mutex_);
+        auto it = streams_.find(streamId);
+        return it != streams_.end() && !it->second->closed;
+    }
+
     void cancel(int streamId) {
         std::lock_guard lock(mutex_);
         if (!session_ || stopping_) return;
@@ -397,6 +413,7 @@ public:
             }
         }
         changed_.notify_all();
+        if (keepalive_.joinable()) keepalive_.join();
         {
             std::lock_guard lock(mutex_);
             for (auto& [id, stream] : streams_) {
@@ -428,6 +445,7 @@ private:
         bool closed{};
         bool vlessHeaderDone{};
         bool observed{};
+        bool prematureDownloadClose{};
         SOCKET local{INVALID_SOCKET};
         std::function<void(std::vector<unsigned char>)> udpPacketHandler;
     };
@@ -530,6 +548,33 @@ private:
         }
     }
 
+    void keepaliveLoop() {
+        for (;;) {
+            std::unique_lock lock(mutex_);
+            if (changed_.wait_for(lock, std::chrono::seconds(8), [&] { return stopping_ || failed_; })) return;
+            std::array<uint8_t, 8> opaque{};
+            unsigned long long tick = GetTickCount64();
+            for (size_t i = 0; i < opaque.size(); ++i)
+                opaque[i] = static_cast<uint8_t>(tick >> (i * 8U));
+            int result = nghttp2_submit_ping(session_, NGHTTP2_FLAG_NONE, opaque.data());
+            if (result == 0) result = nghttp2_session_send(session_);
+            if (result != 0) {
+                failed_ = true;
+                failure_ = h2Error(L"HTTP/2 keepalive", result);
+                for (auto& [id, stream] : streams_) {
+                    (void)id;
+                    if (stream->download && stream->local != INVALID_SOCKET) shutdown(stream->local, SD_BOTH);
+                }
+                changed_.notify_all();
+                return;
+            }
+#ifdef BIG_HEAD_VPN_TESTING
+            fwprintf(stderr, L"h2_keepalive ping\n");
+            fflush(stderr);
+#endif
+        }
+    }
+
     static ssize_t sendCallback(nghttp2_session*, const uint8_t* data, size_t length, int, void* userData) {
         auto& self = *static_cast<H2Connection*>(userData);
         std::wstring error;
@@ -589,7 +634,7 @@ private:
         return 0;
     }
 
-    static int dataCallback(nghttp2_session*, uint8_t, int32_t streamId,
+    static int dataCallback(nghttp2_session* session, uint8_t, int32_t streamId,
         const uint8_t* data, size_t length, void* userData) {
         auto& self = *static_cast<H2Connection*>(userData);
         auto it = self.streams_.find(streamId);
@@ -621,8 +666,15 @@ private:
                     stream.pending.begin() + static_cast<std::ptrdiff_t>(packetLength + 2));
             }
         } else if (!stream.pending.empty()) {
-            if (!sendAll(stream.local, stream.pending.data(), stream.pending.size()))
-                return NGHTTP2_ERR_CALLBACK_FAILURE;
+            if (!sendAll(stream.local, stream.pending.data(), stream.pending.size())) {
+                // Discord routinely closes speculative sockets while their
+                // response is already in flight. Cancel only this stream;
+                // returning CALLBACK_FAILURE would poison the shared XMUX.
+                stream.pending.clear();
+                stream.local = INVALID_SOCKET;
+                nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE, streamId, NGHTTP2_CANCEL);
+                return 0;
+            }
             stream.pending.clear();
         }
         return 0;
@@ -634,8 +686,11 @@ private:
         auto it = self.streams_.find(streamId);
         if (it != self.streams_.end()) {
             it->second->closed = true;
-            if (it->second->download && !self.stopping_ && it->second->local != INVALID_SOCKET)
-                shutdown(it->second->local, SD_BOTH);
+            if (it->second->download && !self.stopping_) {
+                if (errorCode == NGHTTP2_NO_ERROR && !it->second->vlessHeaderDone)
+                    it->second->prematureDownloadClose = true;
+                if (it->second->local != INVALID_SOCKET) shutdown(it->second->local, SD_BOTH);
+            }
         }
 #ifdef BIG_HEAD_VPN_TESTING
         fwprintf(stderr, L"h2_close stream=%d error=%u\n", streamId, errorCode);
@@ -652,6 +707,7 @@ private:
     std::condition_variable changed_;
     std::map<int, std::unique_ptr<Stream>> streams_;
     std::thread reader_;
+    std::thread keepalive_;
     std::atomic_bool stopping_{};
     bool failed_{};
     std::wstring failure_;
@@ -680,8 +736,25 @@ struct VlessClient::Impl {
     std::mutex udpMutex;
     std::unordered_map<uint32_t, std::shared_ptr<UdpSession>> udpSessions;
     UdpReceiveHandler udpHandler;
+    ErrorHandler errorHandler;
+    std::wstring lastReportedError;
+    unsigned long long lastReportedErrorTick{};
     std::atomic_ullong udpSent{};
     std::atomic_ullong udpReceived{};
+
+    void reportError(const std::wstring& error) {
+        if (error.empty() || stopping) return;
+        ErrorHandler handler;
+        {
+            std::lock_guard lock(udpMutex);
+            unsigned long long now = GetTickCount64();
+            if (error == lastReportedError && now - lastReportedErrorTick < 5000) return;
+            lastReportedError = error;
+            lastReportedErrorTick = now;
+            handler = errorHandler;
+        }
+        if (handler) handler(error);
+    }
 
     ~Impl() {
         stop();
@@ -691,14 +764,13 @@ struct VlessClient::Impl {
 
     void stop() {
         if (stopping.exchange(true)) return;
-        std::shared_ptr<H2Connection> active, pending;
+        std::vector<std::shared_ptr<H2Connection>> transports;
         {
             std::lock_guard lock(connectionMutex);
-            active = connection;
-            pending = pendingConnection;
+            if (connection) transports.push_back(connection);
+            if (pendingConnection && pendingConnection != connection) transports.push_back(pendingConnection);
         }
-        if (active) active->stop();
-        if (pending && pending != active) pending->stop();
+        for (const auto& transport : transports) if (transport) transport->stop();
         {
             std::lock_guard lock(udpMutex);
             udpSessions.clear();
@@ -745,6 +817,9 @@ struct VlessClient::Impl {
         if (stopping) { error = L"VLESS уже остановлен"; return false; }
         std::vector<unsigned char> vlessHeader;
         if (!makeVlessHeader(config, destination, vlessHeader, error)) return false;
+        // XHTTP/XMUX multiplexes every logical TCP and UDP flow over one
+        // persistent HTTP/2 transport. Opening a TLS connection per local
+        // socket overloads this CDN and starves the UDP transport.
         auto transport = acquireConnection(error);
         if (!transport) return false;
         std::string basePath = utf8(config.path) + utf8(newSessionId());
@@ -784,6 +859,8 @@ struct VlessClient::Impl {
             if (upload < 0 || !transport->waitHeaders(upload, error)) return false;
         }
         std::wstring transportError = transport->failure();
+        std::wstring streamError = transport->downloadFailure(download);
+        if (error.empty() && !streamError.empty()) error = std::move(streamError);
         if (error.empty() && !transportError.empty()) error = std::move(transportError);
         return error.empty();
     }
@@ -835,7 +912,8 @@ struct VlessClient::Impl {
             error = L"VLESS UDP session изменил адрес назначения";
             return false;
         }
-        if (!udp->transport || !udp->transport->failure().empty() || udp->download < 0) {
+        if (!udp->transport || !udp->transport->failure().empty() || udp->download < 0 ||
+            !udp->transport->streamOpen(udp->download)) {
             udp->transport = acquireConnection(error);
             if (!udp->transport) return false;
             udp->basePath = utf8(config.path) + utf8(newSessionId());
@@ -889,16 +967,28 @@ std::unique_ptr<VlessClient> VlessClient::connect(const std::wstring& uri, Tunne
 void VlessClient::stop() { if (implementation_) implementation_->stop(); }
 bool VlessClient::relayTcp(const std::string& destination, std::uintptr_t socket,
     std::wstring& error, bool socksReply) {
-    return implementation_ && implementation_->relayTcp(destination, static_cast<SOCKET>(socket), error, socksReply);
+    bool ok = implementation_ && implementation_->relayTcp(destination, static_cast<SOCKET>(socket), error, socksReply);
+    bool localClose = error.rfind(L"Локальное приложение закрыло", 0) == 0;
+    bool emptyDownlink = error == L"VLESS XHTTP: сервер закрыл stream-down без ответа";
+    if (!ok && implementation_ && !localClose && (socksReply || !emptyDownlink))
+        implementation_->reportError(error);
+    return ok;
 }
 bool VlessClient::sendUdp(uint32_t sessionId, const std::string& destination,
     const unsigned char* data, size_t length, std::wstring& error) {
-    return implementation_ && implementation_->sendUdp(sessionId, destination, data, length, error);
+    bool ok = implementation_ && implementation_->sendUdp(sessionId, destination, data, length, error);
+    if (!ok && implementation_) implementation_->reportError(error);
+    return ok;
 }
 void VlessClient::setUdpReceiveHandler(UdpReceiveHandler handler) {
     if (!implementation_) return;
     std::lock_guard lock(implementation_->udpMutex);
     implementation_->udpHandler = std::move(handler);
+}
+void VlessClient::setErrorHandler(ErrorHandler handler) {
+    if (!implementation_) return;
+    std::lock_guard lock(implementation_->udpMutex);
+    implementation_->errorHandler = std::move(handler);
 }
 std::wstring VlessClient::udpDiagnostics() const {
     if (!implementation_) return L"VLESS UDP не запущен";
