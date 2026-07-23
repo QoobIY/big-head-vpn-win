@@ -100,14 +100,23 @@ int wmain(int argc, wchar_t** argv) {
         std::mutex mutex;
         std::condition_variable changed;
         unsigned received = 0;
+        unsigned observed = 0;
         size_t responseLength = 0;
-        client->setUdpReceiveHandler([&](uint32_t session, const std::string&, std::vector<unsigned char> payload) {
+        auto udpHandler = client->addUdpReceiveHandler([&](uint32_t session, const std::string&, std::vector<unsigned char> payload) {
             if (session != 1) return;
             std::lock_guard lock(mutex);
             ++received;
             responseLength = payload.size();
             changed.notify_all();
         });
+        auto observer = client->addUdpReceiveHandler(
+            [&](uint32_t session, const std::string&,
+                std::vector<unsigned char>) {
+                if (session != 1) return;
+                std::lock_guard lock(mutex);
+                ++observed;
+                changed.notify_all();
+            });
         const unsigned char stun[]{0x00,0x01,0x00,0x00,0x21,0x12,0xA4,0x42,
             0x42,0x69,0x67,0x48,0x65,0x61,0x64,0x56,0x50,0x4E,0x30,0x31};
         const std::string destination = argc == 4
@@ -120,12 +129,18 @@ int wmain(int argc, wchar_t** argv) {
             second.data(), second.size(), error);
         if (sent) {
             std::unique_lock lock(mutex);
-            changed.wait_for(lock, std::chrono::seconds(15), [&] { return received >= 2; });
+            changed.wait_for(lock, std::chrono::seconds(15),
+                [&] { return received >= 2 && observed >= 2; });
         }
-        std::cout << (received >= 2 ? "udp_responses=2 last_bytes=" + std::to_string(responseLength) : "udp_failed ")
-                  << (received >= 2 ? "" : utf8(error)) << " " << utf8(client->udpDiagnostics()) << std::endl;
+        const bool passed = received >= 2 && observed >= 2;
+        std::cout << (passed ? "udp_responses=2 handlers=2 last_bytes=" +
+            std::to_string(responseLength) : "udp_failed ")
+                  << (passed ? "" : utf8(error)) << " "
+                  << utf8(client->udpDiagnostics()) << std::endl;
+        client->removeUdpReceiveHandler(observer);
+        client->removeUdpReceiveHandler(udpHandler);
         client->stop();
-        return received >= 2 ? 0 : 1;
+        return passed ? 0 : 1;
     }
     if (argc == 4 && (std::wstring_view(argv[1]) == L"--socks-uri" ||
             std::wstring_view(argv[1]) == L"--socks-uri-stop")) {
@@ -194,7 +209,7 @@ int wmain(int argc, wchar_t** argv) {
                << " error=" << utf8(error) << '\n';
         return enabled && visible && cleaned ? 0 : 1;
     }
-    if ((argc == 4 || argc == 5) &&
+    if ((argc == 4 || argc == 5 || argc == 6) &&
         std::wstring_view(argv[1]) == L"--socks-udp") {
         WSADATA winsock{};
         if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) return 1;
@@ -210,25 +225,42 @@ int wmain(int argc, wchar_t** argv) {
         std::memcpy(&relay.sin_port, answer + 8, 2);
         SOCKET udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         DWORD timeout = 10000; setsockopt(udp, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-        const std::string target = argc == 5 ? utf8(argv[4]) :
-            "stun.l.google.com:19302";
-        size_t targetColon = target.rfind(':');
-        if (targetColon == std::string::npos) return 2;
-        const std::string destination = target.substr(0, targetColon);
-        unsigned long destinationPort = strtoul(target.c_str() + targetColon + 1,
-            nullptr, 10);
-        if (!destinationPort || destinationPort > 65535 ||
-            destination.size() > 255) return 2;
         const unsigned char stun[]{0x00,0x01,0x00,0x00,0x21,0x12,0xA4,0x42,0x42,0x69,0x67,0x48,0x65,0x61,0x64,0x56,0x50,0x4E,0x30,0x31};
-        std::vector<unsigned char> request{0,0,0,3,static_cast<unsigned char>(destination.size())};
-        request.insert(request.end(), destination.begin(), destination.end());
-        request.push_back(static_cast<unsigned char>(destinationPort >> 8U));
-        request.push_back(static_cast<unsigned char>(destinationPort));
-        request.insert(request.end(), std::begin(stun), std::end(stun));
-        sendto(udp, reinterpret_cast<const char*>(request.data()), static_cast<int>(request.size()), 0, reinterpret_cast<sockaddr*>(&relay), sizeof(relay));
-        int received = recvfrom(udp, reinterpret_cast<char*>(answer), sizeof(answer), 0, nullptr, nullptr);
-        std::cout << (received > 0 ? "socks_udp_response bytes=" + std::to_string(received) : "socks_udp_timeout") << '\n';
-        closesocket(udp); closesocket(tcp); WSACleanup(); return received > 0 ? 0 : 1;
+        std::vector<std::string> targets;
+        if (argc == 4) targets.push_back("stun.l.google.com:19302");
+        else for (int index = 4; index < argc; ++index)
+            targets.push_back(utf8(argv[index]));
+        unsigned responses{};
+        for (const auto& target : targets) {
+            size_t targetColon = target.rfind(':');
+            if (targetColon == std::string::npos) return 2;
+            const std::string destination = target.substr(0, targetColon);
+            unsigned long destinationPort = strtoul(
+                target.c_str() + targetColon + 1, nullptr, 10);
+            if (!destinationPort || destinationPort > 65535 ||
+                destination.size() > 255) return 2;
+            std::vector<unsigned char> request{
+                0, 0, 0, 3,
+                static_cast<unsigned char>(destination.size())};
+            request.insert(request.end(), destination.begin(),
+                destination.end());
+            request.push_back(
+                static_cast<unsigned char>(destinationPort >> 8U));
+            request.push_back(static_cast<unsigned char>(destinationPort));
+            request.insert(request.end(), std::begin(stun), std::end(stun));
+            sendto(udp, reinterpret_cast<const char*>(request.data()),
+                static_cast<int>(request.size()), 0,
+                reinterpret_cast<sockaddr*>(&relay), sizeof(relay));
+            int received = recvfrom(udp, reinterpret_cast<char*>(answer),
+                sizeof(answer), 0, nullptr, nullptr);
+            if (received <= 0) break;
+            ++responses;
+        }
+        std::cout << (responses == targets.size()
+            ? "socks_udp_responses=" + std::to_string(responses)
+            : "socks_udp_timeout") << '\n';
+        closesocket(udp); closesocket(tcp); WSACleanup();
+        return responses == targets.size() ? 0 : 1;
     }
     if (argc == 2 && std::wstring_view(argv[1]) == L"--direct-udp") {
         WSADATA winsock{}; if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) return 1;
@@ -277,7 +309,7 @@ int wmain(int argc, wchar_t** argv) {
         HysteriaConnectResult result; auto client = HysteriaClient::connect(wide(profiles[profileIndex]), result);
         if (!client || !result.udpEnabled) { std::cout << "udp_connect_failed\n"; return 1; }
         std::mutex mutex; std::condition_variable changed; bool received = false; size_t responseLength = 0;
-        client->setUdpReceiveHandler([&](uint32_t session, const std::string&, std::vector<unsigned char> payload) {
+        auto udpHandler = client->addUdpReceiveHandler([&](uint32_t session, const std::string&, std::vector<unsigned char> payload) {
             if (session != 1U) return; std::lock_guard lock(mutex); received = true; responseLength = payload.size(); changed.notify_all();
         });
         // STUN binding request: unlike public DNS, this destination is not
@@ -291,6 +323,7 @@ int wmain(int argc, wchar_t** argv) {
         std::unique_lock lock(mutex); changed.wait_for(lock, std::chrono::seconds(10), [&] { return received; });
         std::cout << (received ? "udp_response bytes=" + std::to_string(responseLength) : "udp_timeout")
                   << " " << utf8(client->udpDiagnostics()) << '\n';
+        client->removeUdpReceiveHandler(udpHandler);
         return received ? 0 : 1;
     }
     if (socksMode) {

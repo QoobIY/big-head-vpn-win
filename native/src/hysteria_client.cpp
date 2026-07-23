@@ -880,7 +880,7 @@ bool HysteriaClient::sendUdp(uint32_t sessionId, const std::string& destination,
     return ok;
 }
 
-void HysteriaClient::setUdpReceiveHandler(UdpReceiveHandler handler) {
+void HysteriaClient::installUdpReceiveHandler(UdpReceiveHandler handler) {
     if (!implementation_) return;
     std::lock_guard lock(implementation_->udpMutex);
     implementation_->udpHandler = std::move(handler);

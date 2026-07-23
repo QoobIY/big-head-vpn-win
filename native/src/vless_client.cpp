@@ -1114,7 +1114,7 @@ bool VlessClient::sendUdp(uint32_t sessionId, const std::string& destination,
     if (!ok && implementation_) implementation_->reportError(error);
     return ok;
 }
-void VlessClient::setUdpReceiveHandler(UdpReceiveHandler handler) {
+void VlessClient::installUdpReceiveHandler(UdpReceiveHandler handler) {
     if (!implementation_) return;
     std::lock_guard lock(implementation_->udpMutex);
     implementation_->udpHandler = std::move(handler);

@@ -26,12 +26,12 @@ public:
     void stop() override;
     bool relayTcp(const std::string& destination, std::uintptr_t socket, std::wstring& error, bool socksReply = true) override;
     bool sendUdp(uint32_t sessionId, const std::string& destination, const unsigned char* data, size_t length, std::wstring& error) override;
-    void setUdpReceiveHandler(UdpReceiveHandler handler) override;
     void setErrorHandler(ErrorHandler handler) override;
     std::wstring udpDiagnostics() const override;
     bool supportsUdp() const override { return true; }
 
 private:
+    void installUdpReceiveHandler(UdpReceiveHandler handler) override;
     struct Impl;
     explicit HysteriaClient(std::unique_ptr<Impl> implementation);
     std::unique_ptr<Impl> implementation_;

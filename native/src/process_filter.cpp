@@ -208,6 +208,7 @@ struct ProcessFilter::Impl {
     std::atomic_ullong tcpLate{}, tcpLateMax{}, udpLate{}, udpLatePacketCount{}, udpLateMax{}, udpResponseLast{}, udpResponseMax{};
     std::atomic_ulong injectionError{};
     std::atomic_uint32_t nextUdpSession{1};
+    TunnelClient::UdpHandlerToken udpHandlerToken{};
     std::thread socketThread, flowThread, networkThread, acceptThread, acceptThread6;
     std::mutex mutex, workersMutex;
     std::unordered_map<FlowKey, FlowState, FlowHash> selectedFlows;
@@ -274,7 +275,7 @@ struct ProcessFilter::Impl {
         networkHandle = open(networkFilter.c_str(), WINDIVERT_LAYER_NETWORK, 1100, 0);
         if (networkHandle == INVALID_HANDLE_VALUE) { error = windivertOpenError(L"NETWORK", GetLastError(), executablePath); return false; }
         nextUdpSession = static_cast<uint32_t>(GetTickCount64()) | 1U;
-        if (client->supportsUdp()) client->setUdpReceiveHandler([this](uint32_t session, const std::string&, std::vector<unsigned char> payload) {
+        if (client->supportsUdp()) udpHandlerToken = client->addUdpReceiveHandler([this](uint32_t session, const std::string&, std::vector<unsigned char> payload) {
             injectUdp(session, std::move(payload));
         });
         socketThread = std::thread([this] { socketLoop(); });
@@ -614,7 +615,10 @@ struct ProcessFilter::Impl {
 
     void stop() {
         if (stopping.exchange(true)) return;
-        if (client) client->setUdpReceiveHandler({});
+        if (client && udpHandlerToken) {
+            client->removeUdpReceiveHandler(udpHandlerToken);
+            udpHandlerToken = 0;
+        }
         if (socketHandle != INVALID_HANDLE_VALUE && close) { close(socketHandle); socketHandle = INVALID_HANDLE_VALUE; }
         if (flowHandle != INVALID_HANDLE_VALUE && close) { close(flowHandle); flowHandle = INVALID_HANDLE_VALUE; }
         if (networkHandle != INVALID_HANDLE_VALUE && close) { close(networkHandle); networkHandle = INVALID_HANDLE_VALUE; }

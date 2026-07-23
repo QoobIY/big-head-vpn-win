@@ -388,7 +388,7 @@ bool VlessVisionClient::relayTcp(const std::string& destination, std::uintptr_t 
 }
 bool VlessVisionClient::sendUdp(uint32_t, const std::string&, const unsigned char*, size_t,
     std::wstring& error) { error = L"VLESS Vision: UDP пока не включён"; return false; }
-void VlessVisionClient::setUdpReceiveHandler(UdpReceiveHandler) {}
+void VlessVisionClient::installUdpReceiveHandler(UdpReceiveHandler) {}
 void VlessVisionClient::setErrorHandler(ErrorHandler handler) {
     if (!implementation_) return;
     std::lock_guard lock(implementation_->mutex);

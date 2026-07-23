@@ -741,7 +741,11 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             updateFilterStatus();
             SetWindowTextW(app.connect, L"Отключить");
             updateTrayIcon();
-            std::wstring ready = L"SOCKS5 + HTTP CONNECT работают на " + app.model.listenAddress + L":" + std::to_wstring(app.model.listenPort);
+            std::wstring ready = app.session->supportsUdp()
+                ? L"SOCKS5 TCP+UDP + HTTP CONNECT работают на "
+                : L"SOCKS5 TCP + HTTP CONNECT работают на ";
+            ready += app.model.listenAddress + L":" +
+                std::to_wstring(app.model.listenPort);
             if (app.processFilter) ready += app.session->supportsUdp()
                 ? L"; фильтр TCP+UDP (IPv4/IPv6): " + std::to_wstring(app.model.filteredProcesses.size()) + L" процесс(ов) — перезапустите их"
                 : L"; фильтр TCP (IPv4/IPv6): " + std::to_wstring(app.model.filteredProcesses.size()) + L" процесс(ов) — VLESS UDP пока не включён";

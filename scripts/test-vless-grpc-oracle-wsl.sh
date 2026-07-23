@@ -113,12 +113,16 @@ JSON
 python3 -m http.server 28081 --bind 127.0.0.1 \
     >"$oracle_dir/origin.log" 2>&1 &
 origin_pid=$!
-python3 -u -c 'import socket
-s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
-s.bind(("0.0.0.0",28082))
+python3 -u -c 'import select, socket
+sockets=[]
+for port in (28082,28083):
+ s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+ s.bind(("0.0.0.0",port))
+ sockets.append(s)
 while True:
- d,a=s.recvfrom(8192)
- s.sendto(d,a)' >"$oracle_dir/udp-echo.log" 2>&1 &
+ for s in select.select(sockets,[],[])[0]:
+  d,a=s.recvfrom(8192)
+  s.sendto(d,a)' >"$oracle_dir/udp-echo.log" 2>&1 &
 udp_echo_pid=$!
 "$xray_bin" run -c "$oracle_dir/server.json" >"$oracle_dir/server.log" 2>&1 &
 server_pid=$!
@@ -146,7 +150,7 @@ if ! "$probe_bin" --socks-udp "$wsl_address" 2101 "$udp_destination" \
 fi
 
 native_uri="vless://00112233-4455-6677-8899-aabbccddeeff@${wsl_address}:2444?type=grpc&security=reality&serviceName=bhvpn&sni=www.cloudflare.com&pbk=cdll8azvosFOYo1429d1eoZ1_Li7sEXr7_3KNIyNlB0&sid=0123456789abcdef#oracle"
-"$probe_bin" --grpc-socks-uri "$native_uri" 2100 8 >"$oracle_dir/probe.log" 2>&1 &
+"$probe_bin" --grpc-socks-uri "$native_uri" 2100 20 >"$oracle_dir/probe.log" 2>&1 &
 probe_pid=$!
 for attempt in {1..15}; do
     grep -q grpc_socks_ready "$oracle_dir/probe.log" && break
@@ -170,6 +174,16 @@ if [[ "$native_code" != "$official_code" ]]; then
     exit 1
 fi
 
+if ! "$probe_bin" --socks-udp 127.0.0.1 2100 "$udp_destination" \
+    "$wsl_address:28083" \
+    >"$oracle_dir/native-socks-udp.log" 2>&1; then
+    echo "BigHeadVPN local SOCKS5 UDP ASSOCIATE failed" >&2
+    tail -100 "$oracle_dir/native-socks-udp.log" >&2
+    tail -100 "$oracle_dir/probe.log" >&2
+    tail -100 "$oracle_dir/server.log" >&2
+    exit 1
+fi
+
 if ! "$probe_bin" --tunnel-udp-uri "$native_uri" "$udp_destination" \
     >"$oracle_dir/udp-probe.log" 2>&1; then
     echo "BigHeadVPN gRPC UDP probe exited with an error" >&2
@@ -185,4 +199,5 @@ if ! grep -q 'udp_responses=2' "$oracle_dir/udp-probe.log"; then
 fi
 
 udp_result="$(tail -1 "$oracle_dir/udp-probe.log")"
-echo "VLESS gRPC oracle passed: official=$official_code native=$native_code; $udp_result"
+socks_udp_result="$(tail -1 "$oracle_dir/native-socks-udp.log")"
+echo "VLESS gRPC oracle passed: official=$official_code native=$native_code; $socks_udp_result; $udp_result"
