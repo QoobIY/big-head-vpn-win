@@ -14,7 +14,8 @@ SOCKS5 relay проверены на официальном сервере и р
 VLESS TCP/raw через REALITY с `xtls-rprx-vision`: реализация проверяется
 дифференциальным end-to-end тестом против официального Xray. VLESS
 gRPC/REALITY также проходит локальный oracle-тест и проверку реального профиля
-через Discord API.
+через Discord API. Для gRPC проверяются и TCP, и два последовательных UDP
+datagram через локальный echo и публичный STUN.
 Также готов
 экспериментальный фильтр процессов через WinDivert: TCP и UDP поддерживают
 IPv4/IPv6, а UDP передаётся через нативные Hysteria2 QUIC DATAGRAM. PID

@@ -54,9 +54,6 @@ struct DownloadPayload {
 struct ConnectPayload {
     TunnelConnectResult result;
     std::unique_ptr<TunnelClient> session;
-    std::wstring profileId;
-    std::wstring profileName;
-    std::vector<std::wstring> failedProfiles;
 };
 
 struct App {
@@ -239,14 +236,7 @@ void beginConnect(const std::wstring& profileId) {
         showBanner(L"Выбранный сервер больше не существует", true);
         return;
     }
-    std::vector<Profile> candidates{*selected};
     const ProfileKind kind = profileKind(selected->uri);
-    if (kind == ProfileKind::VlessXhttpTls && !selected->groupId.empty()) {
-        for (const auto& profile : app.model.profiles) {
-            if (profile.id != selected->id && profile.groupId == selected->groupId &&
-                profileKind(profile.uri) == kind) candidates.push_back(profile);
-        }
-    }
     app.connecting = true;
     EnableWindow(app.connect, FALSE);
     SetWindowTextW(app.connect, L"Подключение…");
@@ -272,22 +262,9 @@ void beginConnect(const std::wstring& profileId) {
     }
     appendLog(L"Запуск " + profileKindName(kind) + L": " + selected->name);
     HWND target = app.window;
-    std::thread([target, candidates = std::move(candidates)] {
+    std::thread([target, uri = selected->uri] {
         auto payload = std::make_unique<ConnectPayload>();
-        for (const auto& candidate : candidates) {
-            TunnelConnectResult attempt;
-            auto session = connectTunnel(candidate.uri, attempt);
-            if (session && attempt.connected) {
-                payload->session = std::move(session);
-                payload->result = std::move(attempt);
-                payload->profileId = candidate.id;
-                payload->profileName = candidate.name;
-                break;
-            }
-            payload->failedProfiles.push_back(candidate.name +
-                (attempt.message.empty() ? L"" : L": " + attempt.message));
-            payload->result = std::move(attempt);
-        }
+        payload->session = connectTunnel(uri, payload->result);
         PostMessageW(target, WM_CONNECT_READY, 0, reinterpret_cast<LPARAM>(payload.release()));
     }).detach();
 }
@@ -734,15 +711,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_CONNECT_READY: {
         std::unique_ptr<ConnectPayload> payload(reinterpret_cast<ConnectPayload*>(lParam));
         app.connecting = false; EnableWindow(app.connect, TRUE);
-        for (const auto& failed : payload->failedProfiles)
-            appendLog(L"Сервер не прошёл проверку: " + failed);
         if (payload->session && payload->result.connected) {
-            if (!payload->profileId.empty() && payload->profileId != app.model.selectedProfileId) {
-                app.model.selectedProfileId = payload->profileId;
-                app.model.save();
-                refillProfiles();
-                appendLog(L"Автоматически выбран рабочий сервер: " + payload->profileName);
-            }
             app.session = std::move(payload->session);
             HWND target = app.window;
             app.session->setErrorHandler([target](std::wstring error) {
@@ -788,7 +757,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_TUNNEL_ERROR: {
         std::unique_ptr<std::wstring> error(reinterpret_cast<std::wstring*>(lParam));
         if (app.session && error && !error->empty()) {
-            if (error->rfind(L"TCP-запрос не установился", 0) == 0) {
+            if (error->rfind(L"TCP-запрос не установился", 0) == 0 ||
+                error->rfind(L"UDP-запрос не отправлен", 0) == 0) {
                 appendLog(*error);
             } else {
                 showBanner(*error, true);

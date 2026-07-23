@@ -89,7 +89,8 @@ int wmain(int argc, wchar_t** argv) {
                   << (passed ? "" : utf8(error)) << std::endl;
         return passed ? 0 : 1;
     }
-    if (argc == 3 && std::wstring_view(argv[1]) == L"--tunnel-udp-uri") {
+    if ((argc == 3 || argc == 4) &&
+        std::wstring_view(argv[1]) == L"--tunnel-udp-uri") {
         TunnelConnectResult result;
         auto client = connectTunnel(argv[2], result);
         if (!client || !client->supportsUdp()) {
@@ -109,11 +110,14 @@ int wmain(int argc, wchar_t** argv) {
         });
         const unsigned char stun[]{0x00,0x01,0x00,0x00,0x21,0x12,0xA4,0x42,
             0x42,0x69,0x67,0x48,0x65,0x61,0x64,0x56,0x50,0x4E,0x30,0x31};
+        const std::string destination = argc == 4
+            ? utf8(argv[3]) : "stun.l.google.com:19302";
         std::wstring error;
-        bool sent = client->sendUdp(1, "stun.l.google.com:19302", stun, sizeof(stun), error);
+        bool sent = client->sendUdp(1, destination, stun, sizeof(stun), error);
         auto second = std::to_array(stun);
         second.back() ^= 1;
-        sent = sent && client->sendUdp(1, "stun.l.google.com:19302", second.data(), second.size(), error);
+        sent = sent && client->sendUdp(1, destination,
+            second.data(), second.size(), error);
         if (sent) {
             std::unique_lock lock(mutex);
             changed.wait_for(lock, std::chrono::seconds(15), [&] { return received >= 2; });
@@ -190,7 +194,8 @@ int wmain(int argc, wchar_t** argv) {
                << " error=" << utf8(error) << '\n';
         return enabled && visible && cleaned ? 0 : 1;
     }
-    if (argc == 4 && std::wstring_view(argv[1]) == L"--socks-udp") {
+    if ((argc == 4 || argc == 5) &&
+        std::wstring_view(argv[1]) == L"--socks-udp") {
         WSADATA winsock{};
         if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) return 1;
         SOCKET tcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -205,10 +210,20 @@ int wmain(int argc, wchar_t** argv) {
         std::memcpy(&relay.sin_port, answer + 8, 2);
         SOCKET udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         DWORD timeout = 10000; setsockopt(udp, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-        const std::string destination = "stun.l.google.com";
+        const std::string target = argc == 5 ? utf8(argv[4]) :
+            "stun.l.google.com:19302";
+        size_t targetColon = target.rfind(':');
+        if (targetColon == std::string::npos) return 2;
+        const std::string destination = target.substr(0, targetColon);
+        unsigned long destinationPort = strtoul(target.c_str() + targetColon + 1,
+            nullptr, 10);
+        if (!destinationPort || destinationPort > 65535 ||
+            destination.size() > 255) return 2;
         const unsigned char stun[]{0x00,0x01,0x00,0x00,0x21,0x12,0xA4,0x42,0x42,0x69,0x67,0x48,0x65,0x61,0x64,0x56,0x50,0x4E,0x30,0x31};
         std::vector<unsigned char> request{0,0,0,3,static_cast<unsigned char>(destination.size())};
-        request.insert(request.end(), destination.begin(), destination.end()); request.push_back(0x4B); request.push_back(0x66);
+        request.insert(request.end(), destination.begin(), destination.end());
+        request.push_back(static_cast<unsigned char>(destinationPort >> 8U));
+        request.push_back(static_cast<unsigned char>(destinationPort));
         request.insert(request.end(), std::begin(stun), std::end(stun));
         sendto(udp, reinterpret_cast<const char*>(request.data()), static_cast<int>(request.size()), 0, reinterpret_cast<sockaddr*>(&relay), sizeof(relay));
         int received = recvfrom(udp, reinterpret_cast<char*>(answer), sizeof(answer), 0, nullptr, nullptr);

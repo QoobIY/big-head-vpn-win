@@ -143,7 +143,7 @@ bool splitDestination(const std::string& destination, std::string& host, unsigne
 }
 
 bool makeVlessRequest(const GrpcConfig& config, const std::string& destination,
-    std::vector<unsigned char>& output, std::wstring& error) {
+    std::vector<unsigned char>& output, std::wstring& error, unsigned char command = 1) {
     std::string host;
     unsigned short port{};
     if (!splitDestination(destination, host, port)) {
@@ -153,7 +153,7 @@ bool makeVlessRequest(const GrpcConfig& config, const std::string& destination,
     output = {0};
     output.insert(output.end(), config.id.begin(), config.id.end());
     output.push_back(0);
-    output.push_back(1);
+    output.push_back(command);
     output.push_back(static_cast<unsigned char>(port >> 8));
     output.push_back(static_cast<unsigned char>(port));
     in_addr ipv4{};
@@ -231,6 +231,9 @@ nghttp2_nv h2Header(std::string_view name, std::string_view value) {
 class GrpcRelay {
 public:
     GrpcRelay(const GrpcConfig& config, SOCKET local) : config_(config), local_(local) {}
+    GrpcRelay(const GrpcConfig& config,
+        std::function<void(std::vector<unsigned char>)> packetHandler)
+        : config_(config), packetHandler_(std::move(packetHandler)) {}
     ~GrpcRelay() { close(); }
 
     bool connect(std::wstring& error) {
@@ -315,6 +318,11 @@ public:
         return failure_;
     }
 
+    bool usable() const {
+        std::lock_guard lock(mutex_);
+        return !failed_ && !closed_ && !stopping_;
+    }
+
     void close() {
         if (stopping_.exchange(true)) return;
         tls_.shutdownTransport();
@@ -334,7 +342,7 @@ private:
         std::lock_guard lock(mutex_);
         if (closed_ || stopping_) return;
         if (!failed_) { failed_ = true; failure_ = std::move(error); }
-        shutdown(local_, SD_BOTH);
+        if (local_ != INVALID_SOCKET) shutdown(local_, SD_BOTH);
         changed_.notify_all();
     }
 
@@ -346,10 +354,11 @@ private:
                 bool cleanClose = false;
                 {
                     std::lock_guard lock(mutex_);
-                    cleanClose = responseHeader_ && incoming_.empty();
+                    cleanClose = responseHeader_ && incoming_.empty() &&
+                        vlessIncoming_.empty();
                     if (cleanClose) {
                         closed_ = true;
-                        shutdown(local_, SD_BOTH);
+                        if (local_ != INVALID_SOCKET) shutdown(local_, SD_BOTH);
                         changed_.notify_all();
                     }
                 }
@@ -365,13 +374,13 @@ private:
             ssize_t received = nghttp2_session_mem_recv(session_, input.data(), input.size());
             if (received < 0) {
                 if (!failed_) { failed_ = true; failure_ = h2Error(L"разбор ответа", static_cast<int>(received)); }
-                shutdown(local_, SD_BOTH);
+                if (local_ != INVALID_SOCKET) shutdown(local_, SD_BOTH);
                 return;
             }
             int sent = nghttp2_session_send(session_);
             if (sent != 0) {
                 if (!failed_) { failed_ = true; failure_ = h2Error(L"служебный кадр", sent); }
-                shutdown(local_, SD_BOTH);
+                if (local_ != INVALID_SOCKET) shutdown(local_, SD_BOTH);
                 return;
             }
         }
@@ -383,12 +392,34 @@ private:
         size_t payloadLength{};
         if (!readVarint(message, offset, payloadLength) || payloadLength > message.size() - offset) return false;
         std::span<const unsigned char> payload = message.subspan(offset, payloadLength);
+        vlessIncoming_.insert(vlessIncoming_.end(), payload.begin(), payload.end());
         if (!responseHeader_) {
-            if (payload.size() < 2 || payload[0] != 0 || payload.size() < 2U + payload[1]) return false;
-            payload = payload.subspan(2U + payload[1]);
+            if (vlessIncoming_.size() < 2) return true;
+            if (vlessIncoming_[0] != 0) return false;
+            const size_t headerLength = 2U + vlessIncoming_[1];
+            if (vlessIncoming_.size() < headerLength) return true;
+            vlessIncoming_.erase(vlessIncoming_.begin(),
+                vlessIncoming_.begin() + static_cast<std::ptrdiff_t>(headerLength));
             responseHeader_ = true;
         }
-        return payload.empty() || sendAll(local_, payload.data(), payload.size());
+        if (packetHandler_) {
+            while (vlessIncoming_.size() >= 2) {
+                const size_t packetLength =
+                    (static_cast<size_t>(vlessIncoming_[0]) << 8U) | vlessIncoming_[1];
+                if (!packetLength || packetLength > 8190) return false;
+                if (vlessIncoming_.size() < packetLength + 2) break;
+                std::vector<unsigned char> packet(vlessIncoming_.begin() + 2,
+                    vlessIncoming_.begin() + static_cast<std::ptrdiff_t>(packetLength + 2));
+                vlessIncoming_.erase(vlessIncoming_.begin(),
+                    vlessIncoming_.begin() + static_cast<std::ptrdiff_t>(packetLength + 2));
+                packetHandler_(std::move(packet));
+            }
+            return true;
+        }
+        if (vlessIncoming_.empty()) return true;
+        if (!sendAll(local_, vlessIncoming_.data(), vlessIncoming_.size())) return false;
+        vlessIncoming_.clear();
+        return true;
     }
 
     static ssize_t sendCallback(nghttp2_session*, const uint8_t* data, size_t length,
@@ -486,7 +517,7 @@ private:
                 self.failure_ = L"VLESS gRPC закрыл Tun, код " +
                     std::to_wstring(errorCode);
         }
-        shutdown(self.local_, SD_BOTH);
+        if (self.local_ != INVALID_SOCKET) shutdown(self.local_, SD_BOTH);
         self.changed_.notify_all();
         return 0;
     }
@@ -506,6 +537,7 @@ private:
 
     const GrpcConfig& config_;
     SOCKET local_{INVALID_SOCKET};
+    std::function<void(std::vector<unsigned char>)> packetHandler_;
     RealityTls tls_;
     nghttp2_session* session_{};
     int streamId_{-1};
@@ -515,6 +547,7 @@ private:
     std::vector<unsigned char> outgoing_;
     size_t outgoingOffset_{};
     std::vector<unsigned char> incoming_;
+    std::vector<unsigned char> vlessIncoming_;
     std::atomic_bool stopping_{};
     bool uploadEof_{};
     bool responseHeader_{};
@@ -551,18 +584,52 @@ bool makeLoopbackSocketPair(SOCKET& application, SOCKET& relay, std::wstring& er
 }
 
 struct VlessGrpcClient::Impl {
+    struct UdpSession {
+        std::mutex mutex;
+        std::string destination;
+        std::shared_ptr<GrpcRelay> relay;
+        bool headerSent{};
+        std::atomic_ullong lastActivityTick{GetTickCount64()};
+    };
+
     GrpcConfig config;
     std::atomic_bool stopping{};
     bool winsockStarted{};
     mutable std::mutex mutex;
     std::vector<std::shared_ptr<GrpcRelay>> relays;
+    std::unordered_map<uint32_t, std::shared_ptr<UdpSession>> udpSessions;
+    UdpReceiveHandler udpHandler;
     ErrorHandler errorHandler;
+    std::wstring lastReportedError;
+    unsigned long long lastReportedErrorTick{};
+    std::atomic_ullong udpSent{};
+    std::atomic_ullong udpReceived{};
 
     ~Impl() { stop(); if (winsockStarted) WSACleanup(); }
+    void reportError(const std::wstring& error) {
+        if (error.empty() || stopping) return;
+        ErrorHandler handler;
+        {
+            std::lock_guard lock(mutex);
+            const unsigned long long now = GetTickCount64();
+            if (error == lastReportedError && now - lastReportedErrorTick < 5000)
+                return;
+            lastReportedError = error;
+            lastReportedErrorTick = now;
+            handler = errorHandler;
+        }
+        if (handler) handler(error);
+    }
+
     void stop() {
         if (stopping.exchange(true)) return;
         std::vector<std::shared_ptr<GrpcRelay>> active;
-        { std::lock_guard lock(mutex); active = relays; }
+        {
+            std::lock_guard lock(mutex);
+            active = relays;
+            udpSessions.clear();
+            udpHandler = {};
+        }
         for (const auto& relay : active) relay->close();
         { std::lock_guard lock(mutex); relays.clear(); }
     }
@@ -595,6 +662,102 @@ struct VlessGrpcClient::Impl {
         }
         if (error.empty()) error = relay->failure();
         return error.empty();
+    }
+
+    void receiveUdp(uint32_t sessionId, const std::string& destination,
+        std::vector<unsigned char> packet) {
+        UdpReceiveHandler handler;
+        {
+            std::lock_guard lock(mutex);
+            if (stopping || !udpSessions.contains(sessionId)) return;
+            handler = udpHandler;
+        }
+        ++udpReceived;
+        if (handler) handler(sessionId, destination, std::move(packet));
+    }
+
+    bool sendUdp(uint32_t sessionId, const std::string& destination,
+        const unsigned char* data, size_t length, std::wstring& error) {
+        if (stopping) { error = L"VLESS gRPC уже остановлен"; return false; }
+        if (!length || length + 2 > 8192) {
+            error = L"VLESS gRPC UDP-пакет должен иметь размер 1-8190 байт";
+            return false;
+        }
+
+        std::vector<std::shared_ptr<GrpcRelay>> expired;
+        const unsigned long long now = GetTickCount64();
+        std::shared_ptr<UdpSession> udp;
+        {
+            std::lock_guard lock(mutex);
+            for (auto it = udpSessions.begin(); it != udpSessions.end();) {
+                if (it->first != sessionId &&
+                    now - it->second->lastActivityTick.load() > 120000) {
+                    if (it->second->relay) {
+                        expired.push_back(it->second->relay);
+                        std::erase(relays, it->second->relay);
+                    }
+                    it = udpSessions.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            auto& slot = udpSessions[sessionId];
+            if (!slot) {
+                slot = std::make_shared<UdpSession>();
+                slot->destination = destination;
+            }
+            udp = slot;
+        }
+        for (const auto& relay : expired) relay->close();
+
+        std::lock_guard sessionLock(udp->mutex);
+        if (udp->destination != destination) {
+            error = L"VLESS gRPC UDP session изменил адрес назначения";
+            return false;
+        }
+        if (!udp->relay || !udp->relay->usable()) {
+            if (udp->relay) {
+                auto old = std::move(udp->relay);
+                {
+                    std::lock_guard lock(mutex);
+                    std::erase(relays, old);
+                }
+                old->close();
+            }
+            auto relay = std::make_shared<GrpcRelay>(config,
+                [this, sessionId, destination](std::vector<unsigned char> packet) {
+                    receiveUdp(sessionId, destination, std::move(packet));
+                });
+            {
+                std::lock_guard lock(mutex);
+                if (stopping) { error = L"VLESS gRPC уже остановлен"; return false; }
+                relays.push_back(relay);
+            }
+            if (!relay->connect(error)) {
+                {
+                    std::lock_guard lock(mutex);
+                    std::erase(relays, relay);
+                }
+                relay->close();
+                return false;
+            }
+            udp->relay = std::move(relay);
+            udp->headerSent = false;
+        }
+
+        std::vector<unsigned char> payload;
+        payload.reserve(length + 2 + (udp->headerSent ? 0 : 300));
+        if (!udp->headerSent &&
+            !makeVlessRequest(config, destination, payload, error, 2))
+            return false;
+        payload.push_back(static_cast<unsigned char>(length >> 8U));
+        payload.push_back(static_cast<unsigned char>(length));
+        payload.insert(payload.end(), data, data + length);
+        if (!udp->relay->sendPayload(payload, error)) return false;
+        udp->headerSent = true;
+        udp->lastActivityTick = now;
+        ++udpSent;
+        return true;
     }
 };
 
@@ -634,8 +797,8 @@ std::unique_ptr<VlessGrpcClient> VlessGrpcClient::connect(const std::wstring& ur
         return nullptr;
     }
     result.connected = true;
-    result.udpEnabled = false;
-    result.message = L"VLESS gRPC/REALITY проверен — TCP работает";
+    result.udpEnabled = true;
+    result.message = L"VLESS gRPC/REALITY проверен — TCP и UDP работают";
     return client;
 }
 
@@ -644,24 +807,40 @@ bool VlessGrpcClient::relayTcp(const std::string& destination, std::uintptr_t so
     std::wstring& error, bool socksReply) {
     bool ok = implementation_ && implementation_->relayTcp(destination, static_cast<SOCKET>(socket), error, socksReply);
     if (!ok && implementation_) {
-        ErrorHandler handler;
-        { std::lock_guard lock(implementation_->mutex); handler = implementation_->errorHandler; }
-        if (handler && error.rfind(L"Локальное приложение", 0) != 0) {
+        if (error.rfind(L"Локальное приложение", 0) != 0) {
             std::wstring target(destination.begin(), destination.end());
-            handler(L"TCP-запрос не установился (" + target + L"): " + error);
+            implementation_->reportError(
+                L"TCP-запрос не установился (" + target + L"): " + error);
         }
     }
     return ok;
 }
-bool VlessGrpcClient::sendUdp(uint32_t, const std::string&, const unsigned char*, size_t,
+bool VlessGrpcClient::sendUdp(uint32_t sessionId, const std::string& destination,
+    const unsigned char* data, size_t length,
     std::wstring& error) {
-    error = L"VLESS gRPC: UDP пока не включён";
-    return false;
+    bool ok = implementation_ &&
+        implementation_->sendUdp(sessionId, destination, data, length, error);
+    if (!ok && implementation_ && !error.empty()) {
+        implementation_->reportError(L"UDP-запрос не отправлен (" +
+                std::wstring(destination.begin(), destination.end()) + L"): " + error);
+    }
+    return ok;
 }
-void VlessGrpcClient::setUdpReceiveHandler(UdpReceiveHandler) {}
+void VlessGrpcClient::setUdpReceiveHandler(UdpReceiveHandler handler) {
+    if (!implementation_) return;
+    std::lock_guard lock(implementation_->mutex);
+    implementation_->udpHandler = std::move(handler);
+}
 void VlessGrpcClient::setErrorHandler(ErrorHandler handler) {
     if (!implementation_) return;
     std::lock_guard lock(implementation_->mutex);
     implementation_->errorHandler = std::move(handler);
 }
-std::wstring VlessGrpcClient::udpDiagnostics() const { return L"VLESS gRPC: только TCP"; }
+std::wstring VlessGrpcClient::udpDiagnostics() const {
+    if (!implementation_) return L"VLESS gRPC UDP выключен";
+    std::lock_guard lock(implementation_->mutex);
+    return L"VLESS gRPC UDP: сессий " +
+        std::to_wstring(implementation_->udpSessions.size()) + L", отправлено " +
+        std::to_wstring(implementation_->udpSent.load()) + L", получено " +
+        std::to_wstring(implementation_->udpReceived.load());
+}

@@ -23,15 +23,18 @@ server_pid=""
 control_pid=""
 probe_pid=""
 origin_pid=""
+udp_echo_pid=""
 cleanup() {
     [[ -z "$probe_pid" ]] || kill "$probe_pid" 2>/dev/null || true
     [[ -z "$control_pid" ]] || kill "$control_pid" 2>/dev/null || true
     [[ -z "$server_pid" ]] || kill "$server_pid" 2>/dev/null || true
     [[ -z "$origin_pid" ]] || kill "$origin_pid" 2>/dev/null || true
+    [[ -z "$udp_echo_pid" ]] || kill "$udp_echo_pid" 2>/dev/null || true
     [[ -z "$probe_pid" ]] || wait "$probe_pid" 2>/dev/null || true
     [[ -z "$control_pid" ]] || wait "$control_pid" 2>/dev/null || true
     [[ -z "$server_pid" ]] || wait "$server_pid" 2>/dev/null || true
     [[ -z "$origin_pid" ]] || wait "$origin_pid" 2>/dev/null || true
+    [[ -z "$udp_echo_pid" ]] || wait "$udp_echo_pid" 2>/dev/null || true
     rm -rf -- "$oracle_dir"
 }
 trap cleanup EXIT
@@ -63,9 +66,18 @@ cat >"$oracle_dir/server.json" <<'JSON'
     }
   }],
   "outbounds": [{
+    "tag": "tcp-origin",
     "protocol": "freedom",
     "settings": {"redirect": "127.0.0.1:28081"}
-  }]
+  }, {
+    "tag": "udp-direct",
+    "protocol": "freedom"
+  }],
+  "routing": {
+    "rules": [{
+      "type": "field", "network": "udp", "outboundTag": "udp-direct"
+    }]
+  }
 }
 JSON
 
@@ -73,8 +85,8 @@ cat >"$oracle_dir/control.json" <<JSON
 {
   "log": {"loglevel": "warning"},
   "inbounds": [{
-    "listen": "127.0.0.1", "port": 2101, "protocol": "socks",
-    "settings": {"udp": false}
+    "listen": "0.0.0.0", "port": 2101, "protocol": "socks",
+    "settings": {"udp": true}
   }],
   "outbounds": [{
     "protocol": "vless",
@@ -101,6 +113,13 @@ JSON
 python3 -m http.server 28081 --bind 127.0.0.1 \
     >"$oracle_dir/origin.log" 2>&1 &
 origin_pid=$!
+python3 -u -c 'import socket
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+s.bind(("0.0.0.0",28082))
+while True:
+ d,a=s.recvfrom(8192)
+ s.sendto(d,a)' >"$oracle_dir/udp-echo.log" 2>&1 &
+udp_echo_pid=$!
 "$xray_bin" run -c "$oracle_dir/server.json" >"$oracle_dir/server.log" 2>&1 &
 server_pid=$!
 "$xray_bin" run -c "$oracle_dir/control.json" >"$oracle_dir/control.log" 2>&1 &
@@ -113,6 +132,16 @@ if [[ "$official_code" != "200" ]]; then
     echo "Official Xray gRPC control failed: HTTP $official_code" >&2
     tail -60 "$oracle_dir/control.log" >&2
     tail -80 "$oracle_dir/server.log" >&2
+    exit 1
+fi
+
+udp_destination="$wsl_address:28082"
+if ! "$probe_bin" --socks-udp "$wsl_address" 2101 "$udp_destination" \
+    >"$oracle_dir/official-udp.log" 2>&1; then
+    echo "Official Xray gRPC UDP control failed" >&2
+    tail -100 "$oracle_dir/official-udp.log" >&2
+    tail -100 "$oracle_dir/control.log" >&2
+    tail -100 "$oracle_dir/server.log" >&2
     exit 1
 fi
 
@@ -141,4 +170,19 @@ if [[ "$native_code" != "$official_code" ]]; then
     exit 1
 fi
 
-echo "VLESS gRPC oracle passed: official=$official_code native=$native_code"
+if ! "$probe_bin" --tunnel-udp-uri "$native_uri" "$udp_destination" \
+    >"$oracle_dir/udp-probe.log" 2>&1; then
+    echo "BigHeadVPN gRPC UDP probe exited with an error" >&2
+    tail -100 "$oracle_dir/udp-probe.log" >&2
+    tail -100 "$oracle_dir/server.log" >&2
+    exit 1
+fi
+if ! grep -q 'udp_responses=2' "$oracle_dir/udp-probe.log"; then
+    echo "BigHeadVPN gRPC UDP oracle failed" >&2
+    tail -100 "$oracle_dir/udp-probe.log" >&2
+    tail -100 "$oracle_dir/server.log" >&2
+    exit 1
+fi
+
+udp_result="$(tail -1 "$oracle_dir/udp-probe.log")"
+echo "VLESS gRPC oracle passed: official=$official_code native=$native_code; $udp_result"

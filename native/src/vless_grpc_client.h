@@ -20,7 +20,7 @@ public:
     void setUdpReceiveHandler(UdpReceiveHandler) override;
     void setErrorHandler(ErrorHandler handler) override;
     std::wstring udpDiagnostics() const override;
-    bool supportsUdp() const override { return false; }
+    bool supportsUdp() const override { return true; }
 
 private:
     struct Impl;

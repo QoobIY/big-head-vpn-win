@@ -77,6 +77,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+wsl_address="$(hostname -I | awk '{print $1}')"
+if [[ -z "$wsl_address" ]]; then
+    echo "Could not determine the WSL address" >&2
+    exit 1
+fi
+
 authority_json=""
 if [[ -n "$authority" ]]; then
     authority_json=", \"authority\": \"$authority\""
@@ -85,8 +91,8 @@ cat >"$test_dir/xray.json" <<JSON
 {
   "log": {"loglevel": "warning"},
   "inbounds": [{
-    "listen": "127.0.0.1", "port": 2102, "protocol": "socks",
-    "settings": {"udp": false}
+    "listen": "0.0.0.0", "port": 2102, "protocol": "socks",
+    "settings": {"udp": true}
   }],
   "outbounds": [{
     "protocol": "vless",
@@ -121,6 +127,14 @@ if [[ "$official_code" != "200" ]] ||
     exit 1
 fi
 
+if ! "$probe_bin" --socks-udp "$wsl_address" 2102 \
+    >"$test_dir/official-udp.log" 2>&1; then
+    echo "Official Xray real-profile UDP control failed" >&2
+    tail -100 "$test_dir/official-udp.log" >&2
+    tail -100 "$test_dir/xray.log" >&2
+    exit 1
+fi
+
 "$probe_bin" --grpc-socks-uri "$profile_uri" 2100 8 \
     >"$test_dir/probe.log" 2>&1 &
 probe_pid=$!
@@ -144,4 +158,12 @@ if [[ "$native_code" != "$official_code" ]]; then
     exit 1
 fi
 
-echo "VLESS gRPC real profile passed: official=$official_code native=$native_code"
+if ! "$probe_bin" --tunnel-udp-uri "$profile_uri" \
+    >"$test_dir/native-udp.log" 2>&1; then
+    echo "BigHeadVPN real-profile UDP test failed" >&2
+    tail -100 "$test_dir/native-udp.log" >&2
+    exit 1
+fi
+
+native_udp="$(tail -1 "$test_dir/native-udp.log")"
+echo "VLESS gRPC real profile passed: official=$official_code native=$native_code; $native_udp"
