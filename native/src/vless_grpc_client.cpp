@@ -559,6 +559,447 @@ private:
     std::wstring failure_;
 };
 
+// One REALITY/TCP connection and one HTTP/2 session are shared by every gRPC
+// Tun stream. This matches Xray's global grpc.ClientConn: a Discord burst no
+// longer performs a separate REALITY handshake for every socket.
+class SharedGrpcTransport {
+public:
+    struct Stream {
+        SOCKET local{INVALID_SOCKET};
+        std::function<void(std::vector<unsigned char>)> packetHandler;
+        int32_t id{-1};
+        std::vector<unsigned char> outgoing;
+        size_t outgoingOffset{};
+        std::vector<unsigned char> incoming;
+        std::vector<unsigned char> vlessIncoming;
+        bool responseHeader{};
+        bool closed{};
+        bool failed{};
+        bool released{};
+        int httpStatus{};
+        int grpcStatus{-1};
+        std::wstring failure;
+    };
+
+    explicit SharedGrpcTransport(GrpcConfig config)
+        : config_(std::move(config)) {}
+    ~SharedGrpcTransport() { close(); }
+
+    bool connect(std::wstring& error) {
+        if (!tls_.connect(config_.reality, error)) return false;
+        if (!tls_.negotiatedAlpn().empty() &&
+            tls_.negotiatedAlpn() != "h2") {
+            error = L"VLESS gRPC: сервер согласовал неожиданный ALPN";
+            return false;
+        }
+        nghttp2_session_callbacks* callbacks{};
+        if (nghttp2_session_callbacks_new(&callbacks) != 0) {
+            error = L"VLESS gRPC: nghttp2 callbacks";
+            return false;
+        }
+        nghttp2_session_callbacks_set_send_callback(callbacks, sendCallback);
+        nghttp2_session_callbacks_set_on_header_callback(
+            callbacks, headerCallback);
+        nghttp2_session_callbacks_set_on_data_chunk_recv_callback(
+            callbacks, dataCallback);
+        nghttp2_session_callbacks_set_on_stream_close_callback(
+            callbacks, closeCallback);
+        nghttp2_session_callbacks_set_on_frame_recv_callback(
+            callbacks, frameCallback);
+        int result = nghttp2_session_client_new(
+            &session_, callbacks, this);
+        nghttp2_session_callbacks_del(callbacks);
+        if (result != 0) {
+            error = h2Error(L"создание общего сеанса", result);
+            return false;
+        }
+        result = nghttp2_submit_settings(
+            session_, NGHTTP2_FLAG_NONE, nullptr, 0);
+        if (result != 0 || nghttp2_session_send(session_) != 0) {
+            error = h2Error(L"отправка HTTP/2 preface", result);
+            return false;
+        }
+        reader_ = std::thread([this] { readLoop(); });
+        std::unique_lock lock(mutex_);
+        if (!changed_.wait_for(lock, std::chrono::seconds(5),
+                [this] { return serverSettings_ || failed_; })) {
+            error = L"VLESS gRPC: сервер не прислал HTTP/2 SETTINGS";
+            return false;
+        }
+        if (failed_) {
+            error = failure_;
+            return false;
+        }
+        return true;
+    }
+
+    std::shared_ptr<Stream> openStream(SOCKET local,
+        std::function<void(std::vector<unsigned char>)> packetHandler,
+        std::wstring& error) {
+        auto stream = std::make_shared<Stream>();
+        stream->local = local;
+        stream->packetHandler = std::move(packetHandler);
+        std::vector<std::pair<std::string, std::string>> values{
+            {":method", "POST"}, {":scheme", "http"},
+            {":authority", config_.authority}, {":path", config_.path},
+            {"content-type", "application/grpc"}, {"te", "trailers"},
+            {"grpc-encoding", "identity"},
+            {"grpc-accept-encoding", "identity,deflate,gzip"},
+            {"user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/149.0.0.0 Safari/537.36"},
+        };
+        std::vector<nghttp2_nv> headers;
+        for (auto& [name, value] : values)
+            headers.push_back(h2Header(name, value));
+        nghttp2_data_provider provider{};
+        provider.source.ptr = stream.get();
+        provider.read_callback = uploadCallback;
+        std::lock_guard lock(mutex_);
+        if (failed_ || stopping_) {
+            error = failure_.empty()
+                ? L"VLESS gRPC transport закрыт" : failure_;
+            return {};
+        }
+        stream->id = nghttp2_submit_request(session_, nullptr,
+            headers.data(), headers.size(), &provider, stream.get());
+        if (stream->id < 0) {
+            error = h2Error(L"открытие gRPC Tun", stream->id);
+            return {};
+        }
+        streams_.emplace(stream->id, stream);
+        int result = nghttp2_session_send(session_);
+        if (result != 0) {
+            streams_.erase(stream->id);
+            error = h2Error(L"открытие gRPC Tun", result);
+            return {};
+        }
+#ifdef BIG_HEAD_VPN_TESTING
+        fwprintf(stderr, L"grpc_shared_open stream=%d active=%zu\n",
+            stream->id, streams_.size());
+        fflush(stderr);
+#endif
+        return stream;
+    }
+
+    bool sendPayload(const std::shared_ptr<Stream>& stream,
+        std::span<const unsigned char> payload, std::wstring& error) {
+        auto framed = grpcHunk(payload);
+        std::lock_guard lock(mutex_);
+        if (!stream || stream->closed || stream->failed ||
+            failed_ || stopping_) {
+            error = stream && !stream->failure.empty()
+                ? stream->failure
+                : (failure_.empty() ? L"VLESS gRPC stream закрыт" : failure_);
+            return false;
+        }
+        stream->outgoing.insert(stream->outgoing.end(),
+            framed.begin(), framed.end());
+        nghttp2_session_resume_data(session_, stream->id);
+        int result = nghttp2_session_send(session_);
+        if (result != 0) {
+            error = h2Error(L"отправка данных", result);
+            return false;
+        }
+        return true;
+    }
+
+    void release(const std::shared_ptr<Stream>& stream) {
+        if (!stream) return;
+        std::lock_guard lock(mutex_);
+        auto found = streams_.find(stream->id);
+        if (found == streams_.end()) return;
+        stream->local = INVALID_SOCKET;
+        stream->packetHandler = {};
+        stream->released = true;
+        if (stream->closed) {
+            streams_.erase(found);
+            return;
+        }
+        if (session_) {
+            nghttp2_submit_rst_stream(session_, NGHTTP2_FLAG_NONE,
+                stream->id, NGHTTP2_CANCEL);
+            nghttp2_session_send(session_);
+        }
+    }
+
+    bool streamUsable(const std::shared_ptr<Stream>& stream) const {
+        std::lock_guard lock(mutex_);
+        return stream && !stream->closed && !stream->failed &&
+            !failed_ && !stopping_;
+    }
+
+    std::wstring streamFailure(
+        const std::shared_ptr<Stream>& stream) const {
+        std::lock_guard lock(mutex_);
+        if (stream && !stream->failure.empty()) return stream->failure;
+        return failure_;
+    }
+
+    bool usable() const {
+        std::lock_guard lock(mutex_);
+        return !failed_ && !stopping_;
+    }
+
+    size_t streamCount() const {
+        std::lock_guard lock(mutex_);
+        return streams_.size();
+    }
+
+    void close() {
+        if (stopping_.exchange(true)) return;
+        tls_.shutdownTransport();
+        if (reader_.joinable()) reader_.join();
+        {
+            std::lock_guard lock(mutex_);
+            for (const auto& [id, stream] : streams_) {
+                (void)id;
+                if (stream->local != INVALID_SOCKET)
+                    shutdown(stream->local, SD_BOTH);
+            }
+            streams_.clear();
+        }
+        if (session_) {
+            nghttp2_session_del(session_);
+            session_ = nullptr;
+        }
+        tls_.close();
+    }
+
+private:
+    static std::wstring h2Error(const wchar_t* action, int code) {
+        const char* description = nghttp2_strerror(code);
+        return L"VLESS gRPC: " + std::wstring(action) + L": " +
+            std::wstring(description, description + strlen(description));
+    }
+
+    void fail(std::wstring error) {
+        std::lock_guard lock(mutex_);
+        if (stopping_ || failed_) return;
+        failed_ = true;
+        failure_ = std::move(error);
+        for (const auto& [id, stream] : streams_) {
+            (void)id;
+            stream->failed = true;
+            stream->failure = failure_;
+            if (stream->local != INVALID_SOCKET)
+                shutdown(stream->local, SD_BOTH);
+        }
+        changed_.notify_all();
+    }
+
+    void readLoop() {
+        while (!stopping_) {
+            std::vector<unsigned char> input;
+            std::wstring error;
+            if (!tls_.read(input, error)) {
+                if (!stopping_) fail(std::move(error));
+                return;
+            }
+            std::lock_guard lock(mutex_);
+            ssize_t received = nghttp2_session_mem_recv(
+                session_, input.data(), input.size());
+            if (received < 0) {
+                failed_ = true;
+                failure_ = h2Error(
+                    L"разбор общего ответа", static_cast<int>(received));
+                for (const auto& [id, stream] : streams_) {
+                    (void)id;
+                    if (stream->local != INVALID_SOCKET)
+                        shutdown(stream->local, SD_BOTH);
+                }
+                return;
+            }
+            int sent = nghttp2_session_send(session_);
+            if (sent != 0) {
+                failed_ = true;
+                failure_ = h2Error(L"служебный кадр", sent);
+                return;
+            }
+        }
+    }
+
+    static bool consumeMessage(Stream& stream,
+        std::span<const unsigned char> message) {
+        size_t offset = 0;
+        if (message.empty() || message[offset++] != 0x0a) return false;
+        size_t payloadLength{};
+        if (!readVarint(message, offset, payloadLength) ||
+            payloadLength > message.size() - offset)
+            return false;
+        auto payload = message.subspan(offset, payloadLength);
+        stream.vlessIncoming.insert(stream.vlessIncoming.end(),
+            payload.begin(), payload.end());
+        if (!stream.responseHeader) {
+            if (stream.vlessIncoming.size() < 2) return true;
+            if (stream.vlessIncoming[0] != 0) return false;
+            size_t headerLength = 2U + stream.vlessIncoming[1];
+            if (stream.vlessIncoming.size() < headerLength) return true;
+            stream.vlessIncoming.erase(stream.vlessIncoming.begin(),
+                stream.vlessIncoming.begin() +
+                    static_cast<std::ptrdiff_t>(headerLength));
+            stream.responseHeader = true;
+        }
+        if (stream.packetHandler) {
+            while (stream.vlessIncoming.size() >= 2) {
+                size_t packetLength =
+                    (static_cast<size_t>(stream.vlessIncoming[0]) << 8U) |
+                    stream.vlessIncoming[1];
+                if (!packetLength || packetLength > 8190) return false;
+                if (stream.vlessIncoming.size() < packetLength + 2) break;
+                std::vector<unsigned char> packet(
+                    stream.vlessIncoming.begin() + 2,
+                    stream.vlessIncoming.begin() +
+                        static_cast<std::ptrdiff_t>(packetLength + 2));
+                stream.vlessIncoming.erase(stream.vlessIncoming.begin(),
+                    stream.vlessIncoming.begin() +
+                        static_cast<std::ptrdiff_t>(packetLength + 2));
+                stream.packetHandler(std::move(packet));
+            }
+            return true;
+        }
+        if (stream.vlessIncoming.empty()) return true;
+        if (!sendAll(stream.local, stream.vlessIncoming.data(),
+                stream.vlessIncoming.size()))
+            return false;
+        stream.vlessIncoming.clear();
+        return true;
+    }
+
+    static ssize_t sendCallback(nghttp2_session*, const uint8_t* data,
+        size_t length, int, void* userData) {
+        auto& self = *static_cast<SharedGrpcTransport*>(userData);
+        std::wstring error;
+        if (!self.tls_.write(
+                std::span<const unsigned char>(data, length), error)) {
+            self.failed_ = true;
+            self.failure_ = std::move(error);
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
+        return static_cast<ssize_t>(length);
+    }
+
+    static ssize_t uploadCallback(nghttp2_session*, int32_t,
+        uint8_t* buffer, size_t length, uint32_t* flags,
+        nghttp2_data_source* source, void*) {
+        auto& stream = *static_cast<Stream*>(source->ptr);
+        size_t available =
+            stream.outgoing.size() - stream.outgoingOffset;
+        if (!available) return NGHTTP2_ERR_DEFERRED;
+        size_t copied = std::min(length, available);
+        std::copy_n(stream.outgoing.data() + stream.outgoingOffset,
+            copied, buffer);
+        stream.outgoingOffset += copied;
+        if (stream.outgoingOffset == stream.outgoing.size()) {
+            stream.outgoing.clear();
+            stream.outgoingOffset = 0;
+        }
+        (void)flags;
+        return static_cast<ssize_t>(copied);
+    }
+
+    static Stream* findStream(SharedGrpcTransport& self,
+        int32_t id) {
+        auto found = self.streams_.find(id);
+        return found == self.streams_.end() ? nullptr : found->second.get();
+    }
+
+    static int headerCallback(nghttp2_session*,
+        const nghttp2_frame* frame, const uint8_t* name,
+        size_t nameLength, const uint8_t* value, size_t valueLength,
+        uint8_t, void* userData) {
+        if (frame->hd.type != NGHTTP2_HEADERS) return 0;
+        auto& self = *static_cast<SharedGrpcTransport*>(userData);
+        auto* stream = findStream(self, frame->hd.stream_id);
+        if (!stream) return 0;
+        if (nameLength == 7 && memcmp(name, ":status", 7) == 0)
+            stream->httpStatus = atoi(std::string(
+                reinterpret_cast<const char*>(value), valueLength).c_str());
+        else if (nameLength == 11 &&
+            memcmp(name, "grpc-status", 11) == 0)
+            stream->grpcStatus = atoi(std::string(
+                reinterpret_cast<const char*>(value), valueLength).c_str());
+        return 0;
+    }
+
+    static int dataCallback(nghttp2_session*, uint8_t, int32_t streamId,
+        const uint8_t* data, size_t length, void* userData) {
+        auto& self = *static_cast<SharedGrpcTransport*>(userData);
+        auto* stream = findStream(self, streamId);
+        if (!stream) return 0;
+        stream->incoming.insert(
+            stream->incoming.end(), data, data + length);
+        while (stream->incoming.size() >= 5) {
+            if (stream->incoming[0] != 0)
+                return NGHTTP2_ERR_CALLBACK_FAILURE;
+            size_t messageLength =
+                (static_cast<size_t>(stream->incoming[1]) << 24U) |
+                (static_cast<size_t>(stream->incoming[2]) << 16U) |
+                (static_cast<size_t>(stream->incoming[3]) << 8U) |
+                stream->incoming[4];
+            if (messageLength > 4U * 1024U * 1024U)
+                return NGHTTP2_ERR_CALLBACK_FAILURE;
+            if (stream->incoming.size() < messageLength + 5) break;
+            if (!consumeMessage(*stream,
+                    std::span<const unsigned char>(stream->incoming)
+                        .subspan(5, messageLength)))
+                return NGHTTP2_ERR_CALLBACK_FAILURE;
+            stream->incoming.erase(stream->incoming.begin(),
+                stream->incoming.begin() +
+                    static_cast<std::ptrdiff_t>(messageLength + 5));
+        }
+        return 0;
+    }
+
+    static int closeCallback(nghttp2_session*, int32_t streamId,
+        uint32_t errorCode, void* userData) {
+        auto& self = *static_cast<SharedGrpcTransport*>(userData);
+        auto* stream = findStream(self, streamId);
+        if (!stream) return 0;
+        stream->closed = true;
+        bool clean = errorCode == NGHTTP2_NO_ERROR &&
+            stream->httpStatus == 200 &&
+            (stream->grpcStatus == -1 || stream->grpcStatus == 0);
+        if (!clean && !self.stopping_) {
+            stream->failed = true;
+            if (stream->httpStatus != 200)
+                stream->failure = L"VLESS gRPC вернул HTTP " +
+                    std::to_wstring(stream->httpStatus);
+            else
+                stream->failure = L"VLESS gRPC закрыл Tun, код " +
+                    std::to_wstring(errorCode);
+        }
+        if (stream->local != INVALID_SOCKET)
+            shutdown(stream->local, clean ? SD_SEND : SD_BOTH);
+        if (stream->released) self.streams_.erase(streamId);
+        self.changed_.notify_all();
+        return 0;
+    }
+
+    static int frameCallback(nghttp2_session*,
+        const nghttp2_frame* frame, void* userData) {
+        auto& self = *static_cast<SharedGrpcTransport*>(userData);
+        if (frame->hd.type == NGHTTP2_SETTINGS &&
+            !(frame->hd.flags & NGHTTP2_FLAG_ACK)) {
+            self.serverSettings_ = true;
+            self.changed_.notify_all();
+        }
+        return 0;
+    }
+
+    GrpcConfig config_;
+    RealityTls tls_;
+    nghttp2_session* session_{};
+    std::thread reader_;
+    mutable std::mutex mutex_;
+    std::condition_variable changed_;
+    std::unordered_map<int32_t, std::shared_ptr<Stream>> streams_;
+    std::atomic_bool stopping_{};
+    bool serverSettings_{};
+    bool failed_{};
+    std::wstring failure_;
+};
+
 bool makeLoopbackSocketPair(SOCKET& application, SOCKET& relay, std::wstring& error) {
     SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listener == INVALID_SOCKET) { error = L"VLESS gRPC: локальный тестовый сокет не создан"; return false; }
@@ -587,7 +1028,8 @@ struct VlessGrpcClient::Impl {
     struct UdpSession {
         std::mutex mutex;
         std::string destination;
-        std::shared_ptr<GrpcRelay> relay;
+        std::shared_ptr<SharedGrpcTransport> transport;
+        std::shared_ptr<SharedGrpcTransport::Stream> stream;
         bool headerSent{};
         std::atomic_ullong lastActivityTick{GetTickCount64()};
     };
@@ -596,7 +1038,8 @@ struct VlessGrpcClient::Impl {
     std::atomic_bool stopping{};
     bool winsockStarted{};
     mutable std::mutex mutex;
-    std::vector<std::shared_ptr<GrpcRelay>> relays;
+    std::mutex reconnectMutex;
+    std::shared_ptr<SharedGrpcTransport> transport;
     std::unordered_map<uint32_t, std::shared_ptr<UdpSession>> udpSessions;
     UdpReceiveHandler udpHandler;
     ErrorHandler errorHandler;
@@ -623,26 +1066,56 @@ struct VlessGrpcClient::Impl {
 
     void stop() {
         if (stopping.exchange(true)) return;
-        std::vector<std::shared_ptr<GrpcRelay>> active;
+        std::shared_ptr<SharedGrpcTransport> active;
         {
             std::lock_guard lock(mutex);
-            active = relays;
+            active = std::move(transport);
             udpSessions.clear();
             udpHandler = {};
         }
-        for (const auto& relay : active) relay->close();
-        { std::lock_guard lock(mutex); relays.clear(); }
+        if (active) active->close();
+    }
+
+    std::shared_ptr<SharedGrpcTransport> acquireTransport(
+        std::wstring& error) {
+        std::lock_guard reconnectLock(reconnectMutex);
+        std::shared_ptr<SharedGrpcTransport> current;
+        {
+            std::lock_guard lock(mutex);
+            if (stopping) {
+                error = L"VLESS gRPC уже остановлен";
+                return {};
+            }
+            current = transport;
+        }
+        if (current && current->usable()) return current;
+        auto replacement =
+            std::make_shared<SharedGrpcTransport>(config);
+        if (!replacement->connect(error)) return {};
+        {
+            std::lock_guard lock(mutex);
+            if (stopping) {
+                replacement->close();
+                error = L"VLESS gRPC уже остановлен";
+                return {};
+            }
+            current = std::exchange(transport, replacement);
+        }
+        if (current) current->close();
+        return replacement;
     }
 
     bool relayTcp(const std::string& destination, SOCKET local, std::wstring& error, bool socksReply) {
         if (stopping) { error = L"VLESS gRPC уже остановлен"; return false; }
-        auto relay = std::make_shared<GrpcRelay>(config, local);
-        { std::lock_guard lock(mutex); relays.push_back(relay); }
+        auto shared = acquireTransport(error);
+        if (!shared) return false;
+        auto stream = shared->openStream(local, {}, error);
+        if (!stream) return false;
         struct Guard {
-            Impl* owner; std::shared_ptr<GrpcRelay> relay;
-            ~Guard() { relay->close(); std::lock_guard lock(owner->mutex); std::erase(owner->relays, relay); }
-        } guard{this, relay};
-        if (!relay->connect(error)) return false;
+            std::shared_ptr<SharedGrpcTransport> transport;
+            std::shared_ptr<SharedGrpcTransport::Stream> stream;
+            ~Guard() { transport->release(stream); }
+        } guard{shared, stream};
         if (socksReply) {
             static constexpr unsigned char reply[]{5, 0, 0, 1, 0, 0, 0, 0, 0, 0};
             if (!sendAll(local, reply, sizeof(reply))) { error = L"Локальное приложение закрыло SOCKS5"; return false; }
@@ -653,14 +1126,16 @@ struct VlessGrpcClient::Impl {
         int received = recv(local, reinterpret_cast<char*>(buffer.data()), static_cast<int>(buffer.size()), 0);
         if (received <= 0) { error = L"Локальное приложение закрыло соединение до отправки данных"; return false; }
         request.insert(request.end(), buffer.begin(), buffer.begin() + received);
-        if (!relay->sendPayload(request, error)) return false;
+        if (!shared->sendPayload(stream, request, error)) return false;
         while (!stopping) {
             received = recv(local, reinterpret_cast<char*>(buffer.data()), static_cast<int>(buffer.size()), 0);
             if (received <= 0) break;
-            if (!relay->sendPayload(std::span<const unsigned char>(buffer.data(), static_cast<size_t>(received)), error))
+            if (!shared->sendPayload(stream,
+                    std::span<const unsigned char>(buffer.data(),
+                        static_cast<size_t>(received)), error))
                 return false;
         }
-        if (error.empty()) error = relay->failure();
+        if (error.empty()) error = shared->streamFailure(stream);
         return error.empty();
     }
 
@@ -684,7 +1159,8 @@ struct VlessGrpcClient::Impl {
             return false;
         }
 
-        std::vector<std::shared_ptr<GrpcRelay>> expired;
+        std::vector<std::pair<std::shared_ptr<SharedGrpcTransport>,
+            std::shared_ptr<SharedGrpcTransport::Stream>>> expired;
         const unsigned long long now = GetTickCount64();
         std::shared_ptr<UdpSession> udp;
         {
@@ -692,10 +1168,9 @@ struct VlessGrpcClient::Impl {
             for (auto it = udpSessions.begin(); it != udpSessions.end();) {
                 if (it->first != sessionId &&
                     now - it->second->lastActivityTick.load() > 120000) {
-                    if (it->second->relay) {
-                        expired.push_back(it->second->relay);
-                        std::erase(relays, it->second->relay);
-                    }
+                    if (it->second->transport && it->second->stream)
+                        expired.emplace_back(it->second->transport,
+                            it->second->stream);
                     it = udpSessions.erase(it);
                 } else {
                     ++it;
@@ -708,40 +1183,28 @@ struct VlessGrpcClient::Impl {
             }
             udp = slot;
         }
-        for (const auto& relay : expired) relay->close();
+        for (const auto& [expiredTransport, expiredStream] : expired)
+            expiredTransport->release(expiredStream);
 
         std::lock_guard sessionLock(udp->mutex);
         if (udp->destination != destination) {
             error = L"VLESS gRPC UDP session изменил адрес назначения";
             return false;
         }
-        if (!udp->relay || !udp->relay->usable()) {
-            if (udp->relay) {
-                auto old = std::move(udp->relay);
-                {
-                    std::lock_guard lock(mutex);
-                    std::erase(relays, old);
-                }
-                old->close();
-            }
-            auto relay = std::make_shared<GrpcRelay>(config,
-                [this, sessionId, destination](std::vector<unsigned char> packet) {
+        if (!udp->transport ||
+            !udp->transport->streamUsable(udp->stream)) {
+            if (udp->transport && udp->stream)
+                udp->transport->release(udp->stream);
+            auto shared = acquireTransport(error);
+            if (!shared) return false;
+            auto stream = shared->openStream(INVALID_SOCKET,
+                [this, sessionId, destination](
+                    std::vector<unsigned char> packet) {
                     receiveUdp(sessionId, destination, std::move(packet));
-                });
-            {
-                std::lock_guard lock(mutex);
-                if (stopping) { error = L"VLESS gRPC уже остановлен"; return false; }
-                relays.push_back(relay);
-            }
-            if (!relay->connect(error)) {
-                {
-                    std::lock_guard lock(mutex);
-                    std::erase(relays, relay);
-                }
-                relay->close();
-                return false;
-            }
-            udp->relay = std::move(relay);
+                }, error);
+            if (!stream) return false;
+            udp->transport = std::move(shared);
+            udp->stream = std::move(stream);
             udp->headerSent = false;
         }
 
@@ -753,7 +1216,9 @@ struct VlessGrpcClient::Impl {
         payload.push_back(static_cast<unsigned char>(length >> 8U));
         payload.push_back(static_cast<unsigned char>(length));
         payload.insert(payload.end(), data, data + length);
-        if (!udp->relay->sendPayload(payload, error)) return false;
+        if (!udp->transport->sendPayload(
+                udp->stream, payload, error))
+            return false;
         udp->headerSent = true;
         udp->lastActivityTick = now;
         ++udpSent;

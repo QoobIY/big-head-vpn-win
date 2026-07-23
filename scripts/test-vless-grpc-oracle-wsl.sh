@@ -150,7 +150,7 @@ if ! "$probe_bin" --socks-udp "$wsl_address" 2101 "$udp_destination" \
 fi
 
 native_uri="vless://00112233-4455-6677-8899-aabbccddeeff@${wsl_address}:2444?type=grpc&security=reality&serviceName=bhvpn&sni=www.cloudflare.com&pbk=cdll8azvosFOYo1429d1eoZ1_Li7sEXr7_3KNIyNlB0&sid=0123456789abcdef#oracle"
-"$probe_bin" --grpc-socks-uri "$native_uri" 2100 20 >"$oracle_dir/probe.log" 2>&1 &
+"$probe_bin" --grpc-socks-uri "$native_uri" 2100 35 >"$oracle_dir/probe.log" 2>&1 &
 probe_pid=$!
 for attempt in {1..15}; do
     grep -q grpc_socks_ready "$oracle_dir/probe.log" && break
@@ -171,6 +171,34 @@ if [[ "$native_code" != "$official_code" ]]; then
     echo "gRPC differential mismatch: official=$official_code native=$native_code" >&2
     tail -100 "$oracle_dir/probe.log" >&2
     tail -100 "$oracle_dir/server.log" >&2
+    exit 1
+fi
+
+stress_pids=()
+for index in {1..8}; do
+    /mnt/c/Windows/System32/curl.exe -sS --max-time 15 \
+        --proxy socks5h://127.0.0.1:2100 -o NUL -w '%{http_code}' \
+        http://one.one.one.one/ \
+        >"$oracle_dir/stress-$index.code" 2>"$oracle_dir/stress-$index.log" &
+    stress_pids+=("$!")
+done
+stress_failed=0
+for pid in "${stress_pids[@]}"; do
+    wait "$pid" || stress_failed=1
+done
+for index in {1..8}; do
+    [[ "$(tr -d '\r\n' <"$oracle_dir/stress-$index.code")" == "200" ]] ||
+        stress_failed=1
+done
+if [[ "$stress_failed" != 0 ]]; then
+    echo "BigHeadVPN shared gRPC concurrent-stream test failed" >&2
+    for index in {1..8}; do
+        printf 'stream %s: code=' "$index" >&2
+        cat "$oracle_dir/stress-$index.code" >&2 || true
+        cat "$oracle_dir/stress-$index.log" >&2 || true
+    done
+    tail -150 "$oracle_dir/probe.log" >&2
+    tail -150 "$oracle_dir/server.log" >&2
     exit 1
 fi
 
@@ -200,4 +228,10 @@ fi
 
 udp_result="$(tail -1 "$oracle_dir/udp-probe.log")"
 socks_udp_result="$(tail -1 "$oracle_dir/native-socks-udp.log")"
-echo "VLESS gRPC oracle passed: official=$official_code native=$native_code; $socks_udp_result; $udp_result"
+if ! wait "$probe_pid"; then
+    echo "BigHeadVPN shared gRPC transport failed during graceful shutdown" >&2
+    tail -150 "$oracle_dir/probe.log" >&2
+    exit 1
+fi
+probe_pid=""
+echo "VLESS gRPC oracle passed: official=$official_code native=$native_code; concurrent_streams=8; $socks_udp_result; $udp_result"

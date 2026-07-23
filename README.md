@@ -16,7 +16,9 @@ VLESS TCP/raw через REALITY с `xtls-rprx-vision`: реализация п�
 gRPC/REALITY также проходит локальный oracle-тест и проверку реального профиля
 через Discord API. Для gRPC проверяются TCP, прямой UDP-транспорт и полный
 SOCKS5 UDP ASSOCIATE с двумя разными адресатами через локальный echo, а также
-публичный STUN.
+публичный STUN. TCP и UDP используют один общий REALITY/HTTP2 transport с
+отдельными gRPC stream; oracle дополнительно проверяет восемь одновременных
+TCP-stream.
 Также готов
 экспериментальный фильтр процессов через WinDivert: TCP и UDP поддерживают
 IPv4/IPv6, а UDP передаётся через нативные Hysteria2 QUIC DATAGRAM. PID

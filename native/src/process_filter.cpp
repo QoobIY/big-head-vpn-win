@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <mutex>
 #include <system_error>
@@ -41,6 +43,26 @@ struct Flow6Hash {
         return value;
     }
 };
+
+bool localDnsAddress(uint32_t networkAddress) {
+    uint32_t address = ntohl(networkAddress);
+    return (address >> 24U) == 10U ||
+        (address >> 20U) == 0xac1U ||
+        (address >> 16U) == 0xc0a8U ||
+        (address >> 16U) == 0xa9feU ||
+        (address >> 24U) == 127U;
+}
+
+bool localDnsAddress(const std::array<uint32_t, 4>& address) {
+    const auto* bytes =
+        reinterpret_cast<const unsigned char*>(address.data());
+    bool loopback = true;
+    for (size_t index = 0; index < 15; ++index)
+        loopback = loopback && bytes[index] == 0;
+    return (bytes[0] & 0xfeU) == 0xfcU ||
+        (bytes[0] == 0xfeU && (bytes[1] & 0xc0U) == 0x80U) ||
+        (loopback && bytes[15] == 1);
+}
 struct NatKey {
     uint32_t remoteAddress{};
     uint16_t clientPort{};
@@ -88,6 +110,30 @@ struct PendingObservation {
 void updateMaximum(std::atomic_ullong& target, unsigned long long value) {
     unsigned long long current = target.load();
     while (current < value && !target.compare_exchange_weak(current, value)) {}
+}
+
+bool localIpv4(uint32_t networkAddress) {
+    const uint32_t address = ntohl(networkAddress);
+    return (address >> 24U) == 0U ||
+        (address >> 24U) == 10U ||
+        (address >> 24U) == 127U ||
+        (address >> 20U) == 0xAC1U ||
+        (address >> 16U) == 0xA9FEU ||
+        (address >> 16U) == 0xC0A8U ||
+        (address >> 28U) == 0xEU ||
+        address == 0xFFFFFFFFU;
+}
+
+bool localIpv6(const UINT32 address[4]) {
+    const auto* bytes = reinterpret_cast<const unsigned char*>(address);
+    const bool unspecifiedOrLoopback =
+        std::all_of(bytes, bytes + 15,
+            [](unsigned char byte) { return byte == 0; }) &&
+        (bytes[15] == 0 || bytes[15] == 1);
+    return unspecifiedOrLoopback ||
+        (bytes[0] & 0xFEU) == 0xFCU ||
+        (bytes[0] == 0xFEU && (bytes[1] & 0xC0U) == 0x80U) ||
+        bytes[0] == 0xFFU;
 }
 
 std::wstring lower(std::wstring value) {
@@ -187,6 +233,11 @@ std::filesystem::path findWinDivertRuntime(const std::filesystem::path& exeDir, 
 }
 
 struct ProcessFilter::Impl {
+    struct PendingUdpSend {
+        uint32_t session{};
+        std::string destination;
+        std::vector<unsigned char> payload;
+    };
     using OpenFn = decltype(&WinDivertOpen);
     using RecvFn = decltype(&WinDivertRecv);
     using SendFn = decltype(&WinDivertSend);
@@ -209,8 +260,10 @@ struct ProcessFilter::Impl {
     std::atomic_ulong injectionError{};
     std::atomic_uint32_t nextUdpSession{1};
     TunnelClient::UdpHandlerToken udpHandlerToken{};
-    std::thread socketThread, flowThread, networkThread, acceptThread, acceptThread6;
-    std::mutex mutex, workersMutex;
+    std::thread socketThread, flowThread, networkThread, acceptThread, acceptThread6, udpSendThread;
+    std::mutex mutex, workersMutex, udpQueueMutex;
+    std::condition_variable udpQueueChanged;
+    std::deque<PendingUdpSend> udpQueue;
     std::unordered_map<FlowKey, FlowState, FlowHash> selectedFlows;
     std::unordered_map<NatKey, NatState, NatHash> nat;
     std::unordered_map<Flow6Key, FlowState, Flow6Hash> selectedFlows6;
@@ -278,6 +331,8 @@ struct ProcessFilter::Impl {
         if (client->supportsUdp()) udpHandlerToken = client->addUdpReceiveHandler([this](uint32_t session, const std::string&, std::vector<unsigned char> payload) {
             injectUdp(session, std::move(payload));
         });
+        if (client->supportsUdp())
+            udpSendThread = std::thread([this] { udpSendLoop(); });
         socketThread = std::thread([this] { socketLoop(); });
         if (client->supportsUdp()) flowThread = std::thread([this] { udpFlowLoop(); });
         networkThread = std::thread([this] { networkLoop(); });
@@ -405,6 +460,11 @@ struct ProcessFilter::Impl {
             PWINDIVERT_IPHDR ip{}; PWINDIVERT_IPV6HDR ip6{}; PWINDIVERT_TCPHDR tcp{}; PWINDIVERT_UDPHDR udp{}; void* payload{}; UINT payloadLength{};
             parse(packet.data(), length, &ip, &ip6, nullptr, nullptr, nullptr, &tcp, &udp, &payload, &payloadLength, nullptr, nullptr);
             if (ip6 && udp) {
+                if (localIpv6(ip6->DstAddr)) {
+                    inject(networkHandle, packet.data(), length, nullptr,
+                        &address);
+                    continue;
+                }
                 Flow6Key key{address6(ip6->DstAddr), ntohs(udp->SrcPort), ntohs(udp->DstPort)};
                 Udp6State state{}; bool divert = false;
                 {
@@ -423,13 +483,24 @@ struct ProcessFilter::Impl {
                 }
                 if (divert) {
                     char host[INET6_ADDRSTRLEN]{}; inet_ntop(AF_INET6, state.remoteAddress.data(), host, sizeof(host)); std::wstring udpError;
-                    if (client->sendUdp(state.session, "[" + std::string(host) + "]:" + std::to_string(state.remotePort),
-                        static_cast<const unsigned char*>(payload), payloadLength, udpError)) ++udpSent;
+                    std::string destination = "[" + std::string(host) +
+                        "]:" + std::to_string(state.remotePort);
+                    if (state.remotePort == 53 &&
+                        localDnsAddress(state.remoteAddress))
+                        destination = "[2606:4700:4700::1111]:53";
+                    queueUdp(state.session, std::move(destination),
+                        static_cast<const unsigned char*>(payload),
+                        payloadLength);
                     continue;
                 }
                 inject(networkHandle, packet.data(), length, nullptr, &address); continue;
             }
             if (ip && udp) {
+                if (localIpv4(ip->DstAddr)) {
+                    inject(networkHandle, packet.data(), length, nullptr,
+                        &address);
+                    continue;
+                }
                 FlowKey key{ip->DstAddr, ntohs(udp->SrcPort), ntohs(udp->DstPort)};
                 UdpState state{}; bool divert = false;
                 {
@@ -449,9 +520,14 @@ struct ProcessFilter::Impl {
                 }
                 if (divert) {
                     char host[INET_ADDRSTRLEN]{}; in_addr remote{}; remote.s_addr = state.remoteAddress; inet_ntop(AF_INET, &remote, host, sizeof(host));
-                    std::wstring udpError;
-                    if (client->sendUdp(state.session, std::string(host) + ":" + std::to_string(state.remotePort),
-                        static_cast<const unsigned char*>(payload), payloadLength, udpError)) ++udpSent;
+                    std::string destination = std::string(host) + ":" +
+                        std::to_string(state.remotePort);
+                    bool localDns = state.remotePort == 53 &&
+                        localDnsAddress(state.remoteAddress);
+                    if (localDns) destination = "1.1.1.1:53";
+                    queueUdp(state.session, std::move(destination),
+                        static_cast<const unsigned char*>(payload),
+                        payloadLength);
                     continue;
                 }
                 inject(networkHandle, packet.data(), length, nullptr, &address); continue;
@@ -523,6 +599,38 @@ struct ProcessFilter::Impl {
             }
             checksums(packet.data(), length, &address, 0);
             if (!inject(networkHandle, packet.data(), length, nullptr, &address)) { ++injectionFailureCount; injectionError = GetLastError(); }
+        }
+    }
+
+    void queueUdp(uint32_t session, std::string destination,
+        const unsigned char* payload, size_t length) {
+        PendingUdpSend pending;
+        pending.session = session;
+        pending.destination = std::move(destination);
+        pending.payload.assign(payload, payload + length);
+        {
+            std::lock_guard lock(udpQueueMutex);
+            if (udpQueue.size() >= 4096) udpQueue.pop_front();
+            udpQueue.push_back(std::move(pending));
+        }
+        udpQueueChanged.notify_one();
+    }
+
+    void udpSendLoop() {
+        while (!stopping) {
+            PendingUdpSend pending;
+            {
+                std::unique_lock lock(udpQueueMutex);
+                udpQueueChanged.wait(lock,
+                    [this] { return stopping || !udpQueue.empty(); });
+                if (stopping) return;
+                pending = std::move(udpQueue.front());
+                udpQueue.pop_front();
+            }
+            std::wstring error;
+            if (client->sendUdp(pending.session, pending.destination,
+                    pending.payload.data(), pending.payload.size(), error))
+                ++udpSent;
         }
     }
 
@@ -615,6 +723,7 @@ struct ProcessFilter::Impl {
 
     void stop() {
         if (stopping.exchange(true)) return;
+        udpQueueChanged.notify_all();
         if (client && udpHandlerToken) {
             client->removeUdpReceiveHandler(udpHandlerToken);
             udpHandlerToken = 0;
@@ -624,7 +733,7 @@ struct ProcessFilter::Impl {
         if (networkHandle != INVALID_HANDLE_VALUE && close) { close(networkHandle); networkHandle = INVALID_HANDLE_VALUE; }
         if (listener != INVALID_SOCKET) { closesocket(listener); listener = INVALID_SOCKET; }
         if (listener6 != INVALID_SOCKET) { closesocket(listener6); listener6 = INVALID_SOCKET; }
-        if (socketThread.joinable()) socketThread.join(); if (flowThread.joinable()) flowThread.join(); if (networkThread.joinable()) networkThread.join(); if (acceptThread.joinable()) acceptThread.join(); if (acceptThread6.joinable()) acceptThread6.join();
+        if (socketThread.joinable()) socketThread.join(); if (flowThread.joinable()) flowThread.join(); if (networkThread.joinable()) networkThread.join(); if (acceptThread.joinable()) acceptThread.join(); if (acceptThread6.joinable()) acceptThread6.join(); if (udpSendThread.joinable()) udpSendThread.join();
         { std::lock_guard lock(workersMutex); for (SOCKET socket : clients) { shutdown(socket, SD_BOTH); closesocket(socket); } clients.clear(); }
         for (auto& worker : workers) if (worker.joinable()) worker.join(); workers.clear();
         WSACleanup(); if (module) FreeLibrary(module); module = nullptr;
