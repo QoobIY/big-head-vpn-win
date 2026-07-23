@@ -715,6 +715,10 @@ private:
 }
 
 struct VlessClient::Impl {
+    struct TcpConnectionSlot {
+        std::shared_ptr<H2Connection> connection;
+        unsigned usage{};
+    };
     struct UdpSession {
         std::mutex mutex;
         std::string destination;
@@ -731,6 +735,8 @@ struct VlessClient::Impl {
     std::condition_variable connectionChanged;
     std::shared_ptr<H2Connection> connection;
     std::shared_ptr<H2Connection> pendingConnection;
+    std::vector<std::shared_ptr<TcpConnectionSlot>> tcpConnections;
+    std::vector<std::shared_ptr<H2Connection>> pendingTcpConnections;
     bool connecting{};
     bool winsockStarted{};
     std::mutex udpMutex;
@@ -758,7 +764,7 @@ struct VlessClient::Impl {
 
     ~Impl() {
         stop();
-        connection.reset(); pendingConnection.reset();
+        connection.reset(); pendingConnection.reset(); tcpConnections.clear(); pendingTcpConnections.clear();
         if (winsockStarted) WSACleanup();
     }
 
@@ -769,6 +775,8 @@ struct VlessClient::Impl {
             std::lock_guard lock(connectionMutex);
             if (connection) transports.push_back(connection);
             if (pendingConnection && pendingConnection != connection) transports.push_back(pendingConnection);
+            for (const auto& slot : tcpConnections) if (slot->connection) transports.push_back(slot->connection);
+            transports.insert(transports.end(), pendingTcpConnections.begin(), pendingTcpConnections.end());
         }
         for (const auto& transport : transports) if (transport) transport->stop();
         {
@@ -777,6 +785,56 @@ struct VlessClient::Impl {
             udpHandler = {};
         }
         connectionChanged.notify_all();
+    }
+
+    std::shared_ptr<TcpConnectionSlot> acquireTcpConnection(std::wstring& error) {
+        std::shared_ptr<H2Connection> candidate;
+        {
+            std::lock_guard lock(connectionMutex);
+            if (stopping) { error = L"VLESS уже остановлен"; return {}; }
+            std::erase_if(tcpConnections, [](const auto& slot) {
+                return slot->usage == 0 && !slot->connection->failure().empty();
+            });
+            for (const auto& slot : tcpConnections) {
+                if (slot->usage == 0 && slot->connection->failure().empty()) {
+                    ++slot->usage;
+                    return slot;
+                }
+            }
+            if (tcpConnections.size() >= 8) {
+                auto found = std::min_element(tcpConnections.begin(), tcpConnections.end(), [](const auto& left, const auto& right) {
+                    return left->usage < right->usage;
+                });
+                if (found != tcpConnections.end() && (*found)->connection->failure().empty()) {
+                    ++(*found)->usage;
+                    return *found;
+                }
+            }
+            candidate = std::make_shared<H2Connection>(config);
+            pendingTcpConnections.push_back(candidate);
+        }
+        bool connected = candidate->connect(error);
+        std::shared_ptr<TcpConnectionSlot> slot;
+        {
+            std::lock_guard lock(connectionMutex);
+            std::erase(pendingTcpConnections, candidate);
+            if (connected && !stopping) {
+                slot = std::make_shared<TcpConnectionSlot>();
+                slot->connection = candidate;
+                slot->usage = 1;
+                tcpConnections.push_back(slot);
+            }
+        }
+        if (!slot) {
+            candidate->stop();
+            if (error.empty()) error = L"VLESS уже остановлен";
+        }
+        return slot;
+    }
+
+    void releaseTcpConnection(const std::shared_ptr<TcpConnectionSlot>& slot) {
+        std::lock_guard lock(connectionMutex);
+        if (slot && slot->usage) --slot->usage;
     }
 
     std::shared_ptr<H2Connection> acquireConnection(std::wstring& error) {
@@ -817,11 +875,14 @@ struct VlessClient::Impl {
         if (stopping) { error = L"VLESS уже остановлен"; return false; }
         std::vector<unsigned char> vlessHeader;
         if (!makeVlessHeader(config, destination, vlessHeader, error)) return false;
-        // XHTTP/XMUX multiplexes every logical TCP and UDP flow over one
-        // persistent HTTP/2 transport. Opening a TLS connection per local
-        // socket overloads this CDN and starves the UDP transport.
-        auto transport = acquireConnection(error);
-        if (!transport) return false;
+        auto slot = acquireTcpConnection(error);
+        if (!slot) return false;
+        struct LeaseGuard {
+            Impl* owner;
+            std::shared_ptr<TcpConnectionSlot> slot;
+            ~LeaseGuard() { owner->releaseTcpConnection(slot); }
+        } lease{this, slot};
+        auto transport = slot->connection;
         std::string basePath = utf8(config.path) + utf8(newSessionId());
         int download = transport->submitDownload(basePath, local, error);
         if (download < 0) return false;
@@ -949,6 +1010,72 @@ struct VlessClient::Impl {
 VlessClient::VlessClient(std::unique_ptr<Impl> implementation) : implementation_(std::move(implementation)) {}
 VlessClient::~VlessClient() = default;
 
+namespace {
+bool makeLoopbackSocketPair(SOCKET& application, SOCKET& relay, std::wstring& error) {
+    SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener == INVALID_SOCKET) { error = L"VLESS проверка: не удалось создать локальный сокет"; return false; }
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR ||
+        listen(listener, 1) == SOCKET_ERROR) {
+        error = L"VLESS проверка: не удалось открыть локальный канал";
+        closesocket(listener);
+        return false;
+    }
+    int addressLength = sizeof(address);
+    if (getsockname(listener, reinterpret_cast<sockaddr*>(&address), &addressLength) == SOCKET_ERROR) {
+        error = L"VLESS проверка: не удалось определить локальный порт";
+        closesocket(listener);
+        return false;
+    }
+    application = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (application == INVALID_SOCKET ||
+        ::connect(application, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR) {
+        error = L"VLESS проверка: не удалось соединить локальный канал";
+        if (application != INVALID_SOCKET) closesocket(application);
+        application = INVALID_SOCKET;
+        closesocket(listener);
+        return false;
+    }
+    relay = accept(listener, nullptr, nullptr);
+    closesocket(listener);
+    if (relay == INVALID_SOCKET) {
+        error = L"VLESS проверка: локальный канал не принят";
+        closesocket(application);
+        application = INVALID_SOCKET;
+        return false;
+    }
+    return true;
+}
+
+bool activeTcpProbe(VlessClient& client, std::wstring& error) {
+    SOCKET application = INVALID_SOCKET, relay = INVALID_SOCKET;
+    if (!makeLoopbackSocketPair(application, relay, error)) return false;
+    DWORD timeout = 8000;
+    setsockopt(application, SOL_SOCKET, SO_RCVTIMEO,
+        reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+    std::wstring relayError;
+    std::thread worker([&] {
+        client.relayTcp("one.one.one.one:80", reinterpret_cast<std::uintptr_t>(relay), relayError, false);
+        shutdown(relay, SD_BOTH);
+        closesocket(relay);
+    });
+    static constexpr char request[] =
+        "HEAD / HTTP/1.1\r\nHost: one.one.one.one\r\nConnection: close\r\n\r\n";
+    bool sent = sendAll(application, reinterpret_cast<const unsigned char*>(request), sizeof(request) - 1);
+    std::array<char, 32> response{};
+    int received = sent ? recv(application, response.data(), static_cast<int>(response.size()), 0) : SOCKET_ERROR;
+    shutdown(application, SD_BOTH);
+    closesocket(application);
+    worker.join();
+    if (received >= 5 && std::string_view(response.data(), static_cast<size_t>(received)).starts_with("HTTP/"))
+        return true;
+    error = relayError.empty() ? L"VLESS сервер не передал контрольный HTTP-ответ за 8 секунд" : relayError;
+    return false;
+}
+}
+
 std::unique_ptr<VlessClient> VlessClient::connect(const std::wstring& uri, TunnelConnectResult& result) {
     auto implementation = std::make_unique<Impl>();
     if (!parseProfile(uri, implementation->config, result.message)) return nullptr;
@@ -958,10 +1085,17 @@ std::unique_ptr<VlessClient> VlessClient::connect(const std::wstring& uri, Tunne
         return nullptr;
     }
     implementation->winsockStarted = true;
+    auto client = std::unique_ptr<VlessClient>(new VlessClient(std::move(implementation)));
+    std::wstring probeError;
+    if (!activeTcpProbe(*client, probeError)) {
+        client->stop();
+        result.message = L"VLESS сервер не прошёл проверку: " + probeError;
+        return nullptr;
+    }
     result.connected = true;
     result.udpEnabled = true;
-    result.message = L"VLESS XHTTP/TLS готов — TCP и UDP через CDN";
-    return std::unique_ptr<VlessClient>(new VlessClient(std::move(implementation)));
+    result.message = L"VLESS XHTTP/TLS проверен — TCP и UDP через CDN";
+    return client;
 }
 
 void VlessClient::stop() { if (implementation_) implementation_->stop(); }

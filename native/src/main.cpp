@@ -54,6 +54,9 @@ struct DownloadPayload {
 struct ConnectPayload {
     TunnelConnectResult result;
     std::unique_ptr<TunnelClient> session;
+    std::wstring profileId;
+    std::wstring profileName;
+    std::vector<std::wstring> failedProfiles;
 };
 
 struct App {
@@ -228,17 +231,63 @@ void beginDownload(const std::wstring& url, const std::wstring& existingGroupId)
     }).detach();
 }
 
-void beginConnect(const std::wstring& uri) {
+void beginConnect(const std::wstring& profileId) {
     if (app.connecting || app.session) return;
+    auto selected = std::find_if(app.model.profiles.begin(), app.model.profiles.end(),
+        [&](const auto& profile) { return profile.id == profileId; });
+    if (selected == app.model.profiles.end()) {
+        showBanner(L"Выбранный сервер больше не существует", true);
+        return;
+    }
+    std::vector<Profile> candidates{*selected};
+    const ProfileKind kind = profileKind(selected->uri);
+    if (kind == ProfileKind::VlessXhttpTls && !selected->groupId.empty()) {
+        for (const auto& profile : app.model.profiles) {
+            if (profile.id != selected->id && profile.groupId == selected->groupId &&
+                profileKind(profile.uri) == kind) candidates.push_back(profile);
+        }
+    }
     app.connecting = true;
     EnableWindow(app.connect, FALSE);
     SetWindowTextW(app.connect, L"Подключение…");
-    showBanner(uri.rfind(L"vless://", 0) == 0 ? L"Подготавливаю VLESS XHTTP/TLS…" : L"Выполняю QUIC/TLS и HTTP/3 авторизацию…");
-    appendLog(uri.rfind(L"vless://", 0) == 0 ? L"Запуск VLESS XHTTP/TLS" : L"Запуск Hysteria2 handshake");
+    switch (kind) {
+    case ProfileKind::VlessXhttpTls:
+        showBanner(L"Проверяю VLESS XHTTP/TLS…");
+        break;
+    case ProfileKind::Hysteria2:
+        showBanner(L"Выполняю QUIC/TLS и HTTP/3 авторизацию…");
+        break;
+    case ProfileKind::VlessGrpcTls:
+        showBanner(L"VLESS gRPC/TLS ещё не включён в эту сборку", true);
+        break;
+    case ProfileKind::VlessVisionReality:
+        showBanner(L"Проверяю VLESS TCP/REALITY Vision…");
+        break;
+    case ProfileKind::VlessGrpcReality:
+        showBanner(L"Проверяю VLESS gRPC/REALITY…");
+        break;
+    default:
+        showBanner(L"Формат выбранного сервера пока не поддерживается", true);
+        break;
+    }
+    appendLog(L"Запуск " + profileKindName(kind) + L": " + selected->name);
     HWND target = app.window;
-    std::thread([target, uri] {
+    std::thread([target, candidates = std::move(candidates)] {
         auto payload = std::make_unique<ConnectPayload>();
-        payload->session = connectTunnel(uri, payload->result);
+        for (const auto& candidate : candidates) {
+            TunnelConnectResult attempt;
+            auto session = connectTunnel(candidate.uri, attempt);
+            if (session && attempt.connected) {
+                payload->session = std::move(session);
+                payload->result = std::move(attempt);
+                payload->profileId = candidate.id;
+                payload->profileName = candidate.name;
+                break;
+            }
+            payload->failedProfiles.push_back(candidate.name +
+                (attempt.message.empty() ? L"" : L": " + attempt.message));
+            payload->result = std::move(attempt);
+        }
         PostMessageW(target, WM_CONNECT_READY, 0, reinterpret_cast<LPARAM>(payload.release()));
     }).detach();
 }
@@ -634,8 +683,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                     app.session->stop(); app.processFilter.reset(); app.socks.reset(); app.session.reset(); SetWindowTextW(app.connect, L"Подключить");
                     updateTrayIcon();
                     appendLog(L"Старый туннель остановлен при смене сервера");
-                    const auto& uri = app.model.profiles[index].uri;
-                    beginConnect(uri);
+                    beginConnect(app.model.profiles[index].id);
                 }
             }
         } else if (id == ID_GROUPS && notification == CBN_SELCHANGE) {
@@ -658,7 +706,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             if (selected == app.model.profiles.end()) {
                 showBanner(L"Сначала выберите сервер", true);
             } else {
-                beginConnect(selected->uri);
+                beginConnect(selected->id);
             }
         } else if (id == ID_COPY_LOG) {
             SendMessageW(app.log, EM_SETSEL, 0, -1); SendMessageW(app.log, WM_COPY, 0, 0); SendMessageW(app.log, EM_SETSEL, -1, -1);
@@ -686,7 +734,15 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_CONNECT_READY: {
         std::unique_ptr<ConnectPayload> payload(reinterpret_cast<ConnectPayload*>(lParam));
         app.connecting = false; EnableWindow(app.connect, TRUE);
+        for (const auto& failed : payload->failedProfiles)
+            appendLog(L"Сервер не прошёл проверку: " + failed);
         if (payload->session && payload->result.connected) {
+            if (!payload->profileId.empty() && payload->profileId != app.model.selectedProfileId) {
+                app.model.selectedProfileId = payload->profileId;
+                app.model.save();
+                refillProfiles();
+                appendLog(L"Автоматически выбран рабочий сервер: " + payload->profileName);
+            }
             app.session = std::move(payload->session);
             HWND target = app.window;
             app.session->setErrorHandler([target](std::wstring error) {
@@ -732,8 +788,12 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_TUNNEL_ERROR: {
         std::unique_ptr<std::wstring> error(reinterpret_cast<std::wstring*>(lParam));
         if (app.session && error && !error->empty()) {
-            showBanner(*error, true);
-            appendLog(L"Ошибка туннеля: " + *error);
+            if (error->rfind(L"TCP-запрос не установился", 0) == 0) {
+                appendLog(*error);
+            } else {
+                showBanner(*error, true);
+                appendLog(L"Ошибка туннеля: " + *error);
+            }
         }
         return 0;
     }

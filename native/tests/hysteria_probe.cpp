@@ -1,5 +1,7 @@
 #include "hysteria_client.h"
 #include "vless_client.h"
+#include "vless_grpc_client.h"
+#include "reality_tls.h"
 #include "tunnel_client.h"
 #include "socks_server.h"
 #include "process_filter.h"
@@ -42,6 +44,44 @@ std::string utf8(const std::wstring& value) {
 }
 
 int wmain(int argc, wchar_t** argv) {
+    if ((argc == 4 || argc == 5) && std::wstring_view(argv[1]) == L"--grpc-socks-uri") {
+        TunnelConnectResult result;
+        auto client = VlessGrpcClient::connect(argv[2], result);
+        if (!client) {
+            std::cout << "grpc_connect_failed " << utf8(result.message) << std::endl;
+            return 1;
+        }
+        std::wstring error;
+        auto server = SocksServer::start(L"127.0.0.1",
+            static_cast<unsigned short>(_wtoi(argv[3])), *client, error);
+        if (!server) {
+            std::cout << "grpc_listen_failed " << utf8(error) << std::endl;
+            return 1;
+        }
+        std::cout << "grpc_socks_ready" << std::endl;
+        const int duration = argc == 5 ? std::max(1, _wtoi(argv[4])) : 60;
+        std::this_thread::sleep_for(std::chrono::seconds(duration));
+        return 0;
+    }
+    if (argc == 3 && std::wstring_view(argv[1]) == L"--reality-tls-uri") {
+        WSADATA winsock{};
+        if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) return 1;
+        RealityTlsConfig config;
+        std::wstring error;
+        if (!parseRealityTlsConfig(argv[2], config, error)) {
+            std::cout << "reality_parse_failed " << utf8(error) << std::endl;
+            WSACleanup();
+            return 1;
+        }
+        config.alpn = {"h2", "http/1.1"};
+        RealityTls tls;
+        bool connected = tls.connect(config, error);
+        std::cout << (connected ? "reality_tls_ok alpn=" + tls.negotiatedAlpn() :
+            "reality_tls_failed " + utf8(error)) << std::endl;
+        tls.close();
+        WSACleanup();
+        return connected ? 0 : 1;
+    }
     if (argc == 2 && std::wstring_view(argv[1]) == L"--vless-fixture") {
         std::wstring error;
         bool passed = vlessProtocolFixtureForTest(error);

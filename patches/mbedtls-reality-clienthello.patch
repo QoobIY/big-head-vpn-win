@@ -1,0 +1,162 @@
+--- a/include/mbedtls/ssl.h
++++ b/include/mbedtls/ssl.h
+@@ -1449,6 +1449,17 @@
+     void *p;                    /* typically a pointer to extra data */
+ } mbedtls_ssl_user_data_t;
+
++#if defined(MBEDTLS_SSL_PROTO_TLS1_3) && defined(MBEDTLS_SSL_CLI_C)
++/** Transform hook for protocols that authenticate the TLS 1.3 legacy session ID. */
++typedef int mbedtls_ssl_client_hello_transform_t(
++    void *context, mbedtls_svc_key_id_t key_share_private_key,
++    const unsigned char random[32], unsigned char *client_hello_body,
++    size_t client_hello_body_length);
++typedef int mbedtls_ssl_server_certificate_auth_t(
++    void *context, const unsigned char *certificate_der,
++    size_t certificate_der_length);
++#endif
++
+ /**
+  * SSL/TLS configuration to be shared between mbedtls_ssl_context structures.
+  */
+@@ -1542,6 +1553,13 @@
+     int(*MBEDTLS_PRIVATE(f_rng))(void *, unsigned char *, size_t);
+     void *MBEDTLS_PRIVATE(p_rng);                    /*!< context for the RNG function       */
+
++#if defined(MBEDTLS_SSL_PROTO_TLS1_3) && defined(MBEDTLS_SSL_CLI_C)
++    mbedtls_ssl_client_hello_transform_t *MBEDTLS_PRIVATE(f_client_hello_transform);
++    void *MBEDTLS_PRIVATE(p_client_hello_transform);
++    mbedtls_ssl_server_certificate_auth_t *MBEDTLS_PRIVATE(f_server_certificate_auth);
++    void *MBEDTLS_PRIVATE(p_server_certificate_auth);
++#endif
++
+     /** Callback to retrieve a session from the cache                       */
+     mbedtls_ssl_cache_get_t *MBEDTLS_PRIVATE(f_get_cache);
+     /** Callback to store a session into the cache                          */
+@@ -2250,6 +2268,15 @@
+ void mbedtls_ssl_conf_verify(mbedtls_ssl_config *conf,
+                              int (*f_vrfy)(void *, mbedtls_x509_crt *, int, uint32_t *),
+                              void *p_vrfy);
++
++#if defined(MBEDTLS_SSL_PROTO_TLS1_3) && defined(MBEDTLS_SSL_CLI_C)
++void mbedtls_ssl_conf_client_hello_transform(
++    mbedtls_ssl_config *conf, mbedtls_ssl_client_hello_transform_t *callback,
++    void *context);
++void mbedtls_ssl_conf_server_certificate_auth(
++    mbedtls_ssl_config *conf, mbedtls_ssl_server_certificate_auth_t *callback,
++    void *context);
++#endif
+ #endif /* MBEDTLS_X509_CRT_PARSE_C */
+
+ /**
+--- a/library/ssl_tls.c
++++ b/library/ssl_tls.c
+@@ -1675,6 +1675,24 @@
+     conf->f_vrfy      = f_vrfy;
+     conf->p_vrfy      = p_vrfy;
+ }
++
++#if defined(MBEDTLS_SSL_PROTO_TLS1_3) && defined(MBEDTLS_SSL_CLI_C)
++void mbedtls_ssl_conf_client_hello_transform(
++    mbedtls_ssl_config *conf, mbedtls_ssl_client_hello_transform_t *callback,
++    void *context)
++{
++    conf->f_client_hello_transform = callback;
++    conf->p_client_hello_transform = context;
++}
++
++void mbedtls_ssl_conf_server_certificate_auth(
++    mbedtls_ssl_config *conf, mbedtls_ssl_server_certificate_auth_t *callback,
++    void *context)
++{
++    conf->f_server_certificate_auth = callback;
++    conf->p_server_certificate_auth = context;
++}
++#endif
+ #endif /* MBEDTLS_X509_CRT_PARSE_C */
+
+ void mbedtls_ssl_conf_rng(mbedtls_ssl_config *conf,
+--- a/library/ssl_client.c
++++ b/library/ssl_client.c
+@@ -931,6 +931,21 @@
+                                                      &msg_len,
+                                                      &binders_len));
+
++#if defined(MBEDTLS_SSL_PROTO_TLS1_3)
++    if (ssl->conf->f_client_hello_transform != NULL &&
++        ssl->handshake->min_tls_version <= MBEDTLS_SSL_VERSION_TLS1_3 &&
++        MBEDTLS_SSL_VERSION_TLS1_3 <= ssl->tls_version) {
++        MBEDTLS_SSL_PROC_CHK(ssl->conf->f_client_hello_transform(
++            ssl->conf->p_client_hello_transform,
++            ssl->handshake->xxdh_psa_privkey,
++            ssl->handshake->randbytes,
++            buf, msg_len));
++        if (ssl->session_negotiate->id_len == 32 && buf[34] == 32) {
++            memcpy(ssl->session_negotiate->id, buf + 35, 32);
++        }
++    }
++#endif
++
+ #if defined(MBEDTLS_SSL_PROTO_TLS1_2) && defined(MBEDTLS_SSL_PROTO_DTLS)
+     if (ssl->conf->transport == MBEDTLS_SSL_TRANSPORT_DATAGRAM) {
+         ssl->out_msglen = msg_len + 4;
+--- a/library/ssl_misc.h
++++ b/library/ssl_misc.h
+@@ -2654,6 +2654,13 @@
+     const uint16_t sig_alg)
+ {
+
++#if defined(MBEDTLS_SSL_PROTO_TLS1_3)
++    if (ssl->conf->f_server_certificate_auth != NULL &&
++        sig_alg == MBEDTLS_TLS1_3_SIG_ED25519) {
++        return 1;
++    }
++#endif
++
+ #if defined(MBEDTLS_SSL_PROTO_TLS1_2)
+     if (ssl->tls_version == MBEDTLS_SSL_VERSION_TLS1_2) {
+         return mbedtls_ssl_tls12_sig_alg_is_supported(sig_alg);
+--- a/library/ssl_tls13_generic.c
++++ b/library/ssl_tls13_generic.c
+@@ -251,6 +251,15 @@
+     algorithm = MBEDTLS_GET_UINT16_BE(p, 0);
+     p += 2;
+
++    if (ssl->conf->f_server_certificate_auth != NULL) {
++        if (algorithm != MBEDTLS_TLS1_3_SIG_ED25519) goto error;
++        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
++        signature_len = MBEDTLS_GET_UINT16_BE(p, 0);
++        p += 2;
++        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, signature_len);
++        return p + signature_len == end ? 0 : MBEDTLS_ERR_SSL_DECODE_ERROR;
++    }
++
+     /* RFC 8446 section 4.4.3
+      *
+      * If the CertificateVerify message is sent by a server, the signature
+@@ -521,8 +530,13 @@
+         }
+
+         MBEDTLS_SSL_CHK_BUF_READ_PTR(p, certificate_list_end, cert_data_len);
+-        ret = mbedtls_x509_crt_parse_der(ssl->session_negotiate->peer_cert,
+-                                         p, cert_data_len);
++        if (ssl->conf->f_server_certificate_auth != NULL) {
++            ret = ssl->conf->f_server_certificate_auth(
++                ssl->conf->p_server_certificate_auth, p, cert_data_len);
++        } else {
++            ret = mbedtls_x509_crt_parse_der(ssl->session_negotiate->peer_cert,
++                                             p, cert_data_len);
++        }
+
+         switch (ret) {
+             case 0: /*ok*/
+@@ -636,6 +650,10 @@
+ MBEDTLS_CHECK_RETURN_CRITICAL
+ static int ssl_tls13_validate_certificate(mbedtls_ssl_context *ssl)
+ {
++    if (ssl->conf->f_server_certificate_auth != NULL) {
++        ssl->session_negotiate->verify_result = 0;
++        return 0;
++    }
+     /* Authmode: precedence order is SNI if used else configuration */
+ #if defined(MBEDTLS_SSL_SRV_C) && defined(MBEDTLS_SSL_SERVER_NAME_INDICATION)
+     const int authmode = ssl->handshake->sni_authmode != MBEDTLS_SSL_VERIFY_UNSET

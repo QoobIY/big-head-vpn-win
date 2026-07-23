@@ -131,6 +131,56 @@ bool supportedProfile(const std::wstring& uri) {
            scheme == L"hysteria2" || scheme == L"hy2";
 }
 
+ProfileKind profileKind(const std::wstring& uri) {
+    std::wstring lower = uri;
+    std::transform(lower.begin(), lower.end(), lower.begin(), towlower);
+    if (lower.rfind(L"hysteria2://", 0) == 0 || lower.rfind(L"hy2://", 0) == 0)
+        return ProfileKind::Hysteria2;
+    if (lower.rfind(L"vless://", 0) != 0) return ProfileKind::Unsupported;
+
+    auto parameter = [&](std::wstring_view name) {
+        const size_t query = lower.find(L'?');
+        if (query == std::wstring::npos) return std::wstring{};
+        const size_t fragment = lower.find(L'#', query + 1);
+        size_t begin = query + 1;
+        while (begin < lower.size() && begin != fragment) {
+            size_t end = lower.find(L'&', begin);
+            if (end == std::wstring::npos || (fragment != std::wstring::npos && end > fragment)) end = fragment;
+            std::wstring_view field(lower.data() + begin,
+                (end == std::wstring::npos ? lower.size() : end) - begin);
+            const size_t equals = field.find(L'=');
+            if (field.substr(0, equals) == name)
+                return equals == std::wstring_view::npos ? std::wstring{} : std::wstring(field.substr(equals + 1));
+            if (end == std::wstring::npos || end == fragment) break;
+            begin = end + 1;
+        }
+        return std::wstring{};
+    };
+
+    const std::wstring security = parameter(L"security");
+    const std::wstring type = parameter(L"type");
+    const std::wstring flow = parameter(L"flow");
+    if (security == L"reality" && (type == L"tcp" || type == L"raw") &&
+        flow == L"xtls-rprx-vision")
+        return ProfileKind::VlessVisionReality;
+    if (security == L"reality" && type == L"grpc")
+        return ProfileKind::VlessGrpcReality;
+    if (security == L"tls" && type == L"xhttp") return ProfileKind::VlessXhttpTls;
+    if (security == L"tls" && type == L"grpc") return ProfileKind::VlessGrpcTls;
+    return ProfileKind::Unsupported;
+}
+
+std::wstring profileKindName(ProfileKind kind) {
+    switch (kind) {
+    case ProfileKind::Hysteria2: return L"Hysteria2";
+    case ProfileKind::VlessXhttpTls: return L"VLESS XHTTP/TLS";
+    case ProfileKind::VlessGrpcTls: return L"VLESS gRPC/TLS";
+    case ProfileKind::VlessVisionReality: return L"VLESS TCP/REALITY Vision";
+    case ProfileKind::VlessGrpcReality: return L"VLESS gRPC/REALITY";
+    default: return L"неподдерживаемый профиль";
+    }
+}
+
 std::wstring profileName(const std::wstring& uri) {
     auto hash = uri.find(L'#');
     if (hash != std::wstring::npos && hash + 1 < uri.size()) {

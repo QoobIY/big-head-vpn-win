@@ -11,6 +11,11 @@ WinHTTP-загрузка, защищённое DPAPI-хранилище и ко�
 Windows с повышенными правами, поэтому VPN запускается без повторного UAC.
 QUIC/TLS, HTTP/3/QPACK, авторизация Hysteria2 и TCP CONNECT через локальный
 SOCKS5 relay проверены на официальном сервере и реальной подписке. Также готов
+VLESS TCP/raw через REALITY с `xtls-rprx-vision`: реализация проверяется
+дифференциальным end-to-end тестом против официального Xray. VLESS
+gRPC/REALITY также проходит локальный oracle-тест и проверку реального профиля
+через Discord API.
+Также готов
 экспериментальный фильтр процессов через WinDivert: TCP и UDP поддерживают
 IPv4/IPv6, а UDP передаётся через нативные Hysteria2 QUIC DATAGRAM. PID
 сопоставляется с сетевым flow без проксирования трафика самого клиента.
@@ -35,6 +40,21 @@ LLVM-MinGW используется только при сборке и в пр�
 Для фильтра процессов рядом также находятся официальный `WinDivert.dll` и
 `WinDivert64.sys`. Запускайте весь каталог с локального диска Windows, а не
 напрямую через `\\wsl.localhost`; Windows запросит права администратора.
+
+Воспроизводимая проверка VLESS Vision против официального Xray:
+
+```bash
+cmake --build build/native-windows --target BigHeadVPNProbe -j2
+./scripts/test-vless-vision-oracle-wsl.sh /path/to/official-xray
+./scripts/test-vless-grpc-oracle-wsl.sh /path/to/official-xray
+./scripts/test-vless-grpc-profile-wsl.sh \
+    /path/to/official-xray subscription.txt grpc-profile-number
+```
+
+Oracle-сценарии сначала получают HTTP-ответ через официальный клиент Xray,
+затем через `BigHeadVPNProbe` и требуют совпадения кодов. Последний сценарий
+повторяет сравнение на выбранном реальном профиле через Discord Gateway API.
+Xray используется только для тестов и в `dist` не копируется.
 
 В разделе «Процессы через VPN» выберите запущенное приложение слева и нажмите
 «Добавить». Справа остаётся сохранённый список приложений, направляемых через

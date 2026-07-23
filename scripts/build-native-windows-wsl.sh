@@ -23,6 +23,11 @@ NGHTTP2_DIR="$TOOLS_DIR/nghttp2"
 NGHTTP2_ARCHIVE="$TOOLS_DIR/nghttp2-$NGHTTP2_VERSION.tar.xz"
 NGHTTP2_URL="https://github.com/nghttp2/nghttp2/releases/download/v$NGHTTP2_VERSION/nghttp2-$NGHTTP2_VERSION.tar.xz"
 NGHTTP2_SHA256="1fb324b6ec2c56f6bde0658f4139ffd8209fa9e77ce98fd7a5f63af8d0e508ad"
+MBEDTLS_VERSION="3.6.6"
+MBEDTLS_DIR="$TOOLS_DIR/mbedtls"
+MBEDTLS_ARCHIVE="$TOOLS_DIR/mbedtls-$MBEDTLS_VERSION.tar.bz2"
+MBEDTLS_URL="https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-$MBEDTLS_VERSION/mbedtls-$MBEDTLS_VERSION.tar.bz2"
+MBEDTLS_SHA256="8fb65fae8dcae5840f793c0a334860a411f884cc537ea290ce1c52bb64ca007a"
 WINDIVERT_DIR="$TOOLS_DIR/windivert"
 WINDIVERT_ARCHIVE="$TOOLS_DIR/WinDivert-2.2.2-A.zip"
 WINDIVERT_URL="https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip"
@@ -57,6 +62,20 @@ if [[ ! -f "$NGHTTP2_DIR/lib/nghttp2_session.c" ]]; then
   rm -rf "$NGHTTP2_DIR"
   mkdir -p "$NGHTTP2_DIR"
   tar -xJf "$NGHTTP2_ARCHIVE" --strip-components=1 -C "$NGHTTP2_DIR"
+fi
+
+if [[ ! -f "$MBEDTLS_DIR/.big-head-reality-patch" ]]; then
+  command -v patch >/dev/null || { echo "Не найден patch."; exit 1; }
+  echo "Скачиваю закреплённый Mbed TLS $MBEDTLS_VERSION..."
+  if [[ ! -f "$MBEDTLS_ARCHIVE" ]]; then
+    curl -fL "$MBEDTLS_URL" -o "$MBEDTLS_ARCHIVE"
+  fi
+  echo "$MBEDTLS_SHA256  $MBEDTLS_ARCHIVE" | sha256sum -c -
+  rm -rf "$MBEDTLS_DIR"
+  mkdir -p "$MBEDTLS_DIR"
+  tar -xjf "$MBEDTLS_ARCHIVE" --strip-components=1 -C "$MBEDTLS_DIR"
+  patch -d "$MBEDTLS_DIR" -p1 < "$PROJECT_DIR/patches/mbedtls-reality-clienthello.patch"
+  touch "$MBEDTLS_DIR/.big-head-reality-patch"
 fi
 
 if [[ ! -f "$MSQUIC_DIR/bin/msquic.dll" || ! -f "$MSQUIC_DIR/include/msquic.h" ]]; then

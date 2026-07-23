@@ -16,6 +16,15 @@ struct SubscriptionGroup {
     std::wstring url;
 };
 
+enum class ProfileKind {
+    Hysteria2,
+    VlessXhttpTls,
+    VlessGrpcTls,
+    VlessVisionReality,
+    VlessGrpcReality,
+    Unsupported
+};
+
 struct AppModel {
     std::vector<SubscriptionGroup> groups;
     std::vector<Profile> profiles;
@@ -33,3 +42,5 @@ struct AppModel {
 std::wstring newId();
 std::wstring profileName(const std::wstring& uri);
 bool supportedProfile(const std::wstring& uri);
+ProfileKind profileKind(const std::wstring& uri);
+std::wstring profileKindName(ProfileKind kind);
