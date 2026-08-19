@@ -195,7 +195,7 @@ void refillProfiles() {
         SendMessageW(app.profiles, LB_SETITEMDATA, row, static_cast<LPARAM>(i));
         if (profile.id == app.model.selectedProfileId) selected = row;
     }
-    if (selected < 0 && !app.model.profiles.empty()) selected = 0;
+    if (selected < 0 && SendMessageW(app.profiles, LB_GETCOUNT, 0, 0) > 0) selected = 0;
     if (selected >= 0) {
         SendMessageW(app.profiles, LB_SETCURSEL, selected, 0);
         size_t index = static_cast<size_t>(SendMessageW(app.profiles, LB_GETITEMDATA, selected, 0));
@@ -228,6 +228,38 @@ void beginDownload(const std::wstring& url, const std::wstring& existingGroupId)
     }).detach();
 }
 
+void addSubscriptionOrProfile(const std::wstring& input) {
+    std::wstring uri = normalizeProfileUri(input);
+    if (!supportedProfile(uri)) {
+        beginDownload(input, L"");
+        return;
+    }
+
+    auto duplicate = std::find_if(app.model.profiles.begin(), app.model.profiles.end(),
+        [&](const auto& profile) { return profile.uri == uri; });
+    if (duplicate != app.model.profiles.end()) {
+        app.model.selectedProfileId = duplicate->id;
+        app.model.save();
+        refillGroups();
+        SetWindowTextW(app.url, L"");
+        showBanner(L"Этот сервер уже добавлен");
+        return;
+    }
+
+    Profile profile{newId(), L"", profileName(uri), std::move(uri)};
+    const std::wstring name = profile.name;
+    app.model.selectedProfileId = profile.id;
+    app.model.profiles.push_back(std::move(profile));
+    app.model.save();
+    refillGroups();
+    SetWindowTextW(app.url, L"");
+    if (profileKind(app.model.profiles.back().uri) == ProfileKind::Unsupported)
+        showBanner(L"Сервер добавлен, но его транспорт пока не поддерживается", true);
+    else
+        showBanner(L"Сервер добавлен: " + name);
+    appendLog(L"Добавлен отдельный сервер: " + name);
+}
+
 void beginConnect(const std::wstring& profileId) {
     if (app.connecting || app.session) return;
     auto selected = std::find_if(app.model.profiles.begin(), app.model.profiles.end(),
@@ -249,6 +281,9 @@ void beginConnect(const std::wstring& profileId) {
         break;
     case ProfileKind::VlessGrpcTls:
         showBanner(L"VLESS gRPC/TLS ещё не включён в эту сборку", true);
+        break;
+    case ProfileKind::VlessTcpReality:
+        showBanner(L"Проверяю VLESS TCP/REALITY…");
         break;
     case ProfileKind::VlessVisionReality:
         showBanner(L"Проверяю VLESS TCP/REALITY Vision…");
@@ -544,7 +579,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         app.profiles = control(L"LISTBOX", L"", LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT | WS_VSCROLL, ID_PROFILES);
         app.url = control(L"EDIT", L"", ES_AUTOHSCROLL, ID_URL);
         SendMessageW(app.url, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(12, 12));
-        SendMessageW(app.url, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"https://… ссылка подписки"));
+        SendMessageW(app.url, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"https://… подписка или vless://… сервер"));
         app.add = button(L"Добавить", ID_ADD_SUBSCRIPTION);
         app.update = button(L"Обновить", ID_UPDATE_GROUP);
         app.remove = button(L"Удалить группу", ID_DELETE_GROUP);
@@ -639,7 +674,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 showBanner(error.empty() ? L"Не удалось изменить автозагрузку" : error, true);
                 appendLog(L"Ошибка автозагрузки: " + error);
             }
-        } else if (id == ID_ADD_SUBSCRIPTION) beginDownload(windowText(app.url), L"");
+        } else if (id == ID_ADD_SUBSCRIPTION) addSubscriptionOrProfile(windowText(app.url));
         else if (id == ID_REFRESH_PROCESSES) refreshRunningProcesses();
         else if (id == ID_ADD_PROCESS || (id == ID_RUNNING_PROCESSES && notification == LBN_DBLCLK)) addSelectedProcess();
         else if (id == ID_REMOVE_PROCESS || (id == ID_SELECTED_PROCESSES && notification == LBN_DBLCLK)) removeSelectedProcess();

@@ -57,6 +57,45 @@ std::string decodeBase64(const std::string& body) {
 }
 }
 
+std::wstring normalizeProfileUri(std::wstring uri) {
+    auto whitespace = [](wchar_t value) {
+        return value == L' ' || value == L'\t' || value == L'\r' || value == L'\n';
+    };
+    while (!uri.empty() && whitespace(uri.back())) uri.pop_back();
+    size_t begin = 0;
+    while (begin < uri.size() && whitespace(uri[begin])) ++begin;
+    if (begin) uri.erase(0, begin);
+
+    // Messengers and rich-text editors sometimes copy URI punctuation escaped
+    // as Markdown (vless\://, user\@host, public\_key).
+    for (size_t i = 0; i + 1 < uri.size();) {
+        if (uri[i] == L'\\' && (uri[i + 1] == L':' || uri[i + 1] == L'/' ||
+                uri[i + 1] == L'@' || uri[i + 1] == L'_')) {
+            uri.erase(i, 1);
+        } else {
+            ++i;
+        }
+    }
+
+    // Recover query fields copied as Markdown links, for example
+    // &[sni=example.com](https://sni=example.com)&type=tcp.
+    size_t field = 0;
+    while ((field = uri.find(L"&[", field)) != std::wstring::npos) {
+        const size_t labelEnd = uri.find(L"](", field + 2);
+        const size_t targetEnd = labelEnd == std::wstring::npos
+            ? std::wstring::npos : uri.find(L')', labelEnd + 2);
+        if (labelEnd == std::wstring::npos || targetEnd == std::wstring::npos) break;
+        std::wstring label = uri.substr(field + 2, labelEnd - field - 2);
+        if (label.find(L'=') == std::wstring::npos) {
+            field = targetEnd + 1;
+            continue;
+        }
+        uri.replace(field + 1, targetEnd - field, label);
+        field += label.size() + 1;
+    }
+    return uri;
+}
+
 std::vector<Profile> parseSubscriptionText(const std::string& body) {
     std::string text = body;
     if (!looksLikeProfiles(text)) {

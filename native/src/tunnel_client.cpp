@@ -80,8 +80,7 @@ std::unique_ptr<TunnelClient> connectTunnel(const std::wstring& uri, TunnelConne
             return VlessGrpcClient::connect(uri, result);
         if ((lower.find(L"type=tcp") != std::wstring::npos ||
                 lower.find(L"type=raw") != std::wstring::npos) &&
-            lower.find(L"security=reality") != std::wstring::npos &&
-            lower.find(L"flow=xtls-rprx-vision") != std::wstring::npos)
+            lower.find(L"security=reality") != std::wstring::npos)
             return VlessVisionClient::connect(uri, result);
         return VlessClient::connect(uri, result);
     }

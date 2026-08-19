@@ -7,6 +7,7 @@ TOOLCHAIN_DIR="$TOOLS_DIR/llvm-mingw"
 ARCHIVE="$TOOLS_DIR/llvm-mingw.tar.xz"
 BUILD_DIR="$PROJECT_DIR/build/native-windows"
 DIST_DIR="$PROJECT_DIR/dist/BigHeadVPN-Native"
+DIST_ARCHIVE="$PROJECT_DIR/dist/BigHeadVPN-Native.zip"
 TOOLCHAIN_URL="https://github.com/mstorsjo/llvm-mingw/releases/download/20260616/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64.tar.xz"
 TOOLCHAIN_SHA256="534b92e067b22a6b4441f48ae9240a3341b17825d04d577eab0cf85c44b4deda"
 MSQUIC_VERSION="2.5.9"
@@ -118,6 +119,11 @@ cp "$WINDIVERT_DIR/LICENSE" "$DIST_DIR/WINDIVERT_LICENSE.txt"
 cp "$PROJECT_DIR/native/resources/MANROPE_OFL.txt" "$DIST_DIR/MANROPE_LICENSE.txt"
 cp "$PROJECT_DIR/native/README_USER.md" "$DIST_DIR/README.md"
 
+rm -f "$DIST_ARCHIVE"
+cmake -E chdir "$PROJECT_DIR/dist" cmake -E tar cf "$DIST_ARCHIVE" \
+  --format=zip BigHeadVPN-Native
+
 echo
 echo "Готово: $DIST_DIR/BigHeadVPN.exe"
+echo "Архив: $DIST_ARCHIVE"
 du -h "$DIST_DIR/BigHeadVPN.exe" "$DIST_DIR/msquic.dll"

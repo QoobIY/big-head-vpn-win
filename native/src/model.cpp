@@ -160,9 +160,9 @@ ProfileKind profileKind(const std::wstring& uri) {
     const std::wstring security = parameter(L"security");
     const std::wstring type = parameter(L"type");
     const std::wstring flow = parameter(L"flow");
-    if (security == L"reality" && (type == L"tcp" || type == L"raw") &&
-        flow == L"xtls-rprx-vision")
-        return ProfileKind::VlessVisionReality;
+    if (security == L"reality" && (type == L"tcp" || type == L"raw"))
+        return flow == L"xtls-rprx-vision"
+            ? ProfileKind::VlessVisionReality : ProfileKind::VlessTcpReality;
     if (security == L"reality" && type == L"grpc")
         return ProfileKind::VlessGrpcReality;
     if (security == L"tls" && type == L"xhttp") return ProfileKind::VlessXhttpTls;
@@ -175,6 +175,7 @@ std::wstring profileKindName(ProfileKind kind) {
     case ProfileKind::Hysteria2: return L"Hysteria2";
     case ProfileKind::VlessXhttpTls: return L"VLESS XHTTP/TLS";
     case ProfileKind::VlessGrpcTls: return L"VLESS gRPC/TLS";
+    case ProfileKind::VlessTcpReality: return L"VLESS TCP/REALITY";
     case ProfileKind::VlessVisionReality: return L"VLESS TCP/REALITY Vision";
     case ProfileKind::VlessGrpcReality: return L"VLESS gRPC/REALITY";
     default: return L"неподдерживаемый профиль";

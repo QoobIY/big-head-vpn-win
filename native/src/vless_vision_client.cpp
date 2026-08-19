@@ -23,6 +23,7 @@ namespace {
 struct VisionConfig {
     std::array<unsigned char, 16> id{};
     RealityTlsConfig reality;
+    bool vision{};
 };
 
 int hexValue(wchar_t value) {
@@ -77,10 +78,11 @@ bool parseConfig(const std::wstring& uri, VisionConfig& config, std::wstring& er
     std::transform(security.begin(), security.end(), security.begin(), towlower);
     std::transform(flow.begin(), flow.end(), flow.begin(), towlower);
     if ((type != L"tcp" && type != L"raw") || security != L"reality" ||
-        flow != L"xtls-rprx-vision") {
-        error = L"Этот клиент ожидает VLESS TCP/REALITY с XTLS Vision";
+        (!flow.empty() && flow != L"xtls-rprx-vision")) {
+        error = L"Этот клиент ожидает VLESS TCP/REALITY";
         return false;
     }
+    config.vision = flow == L"xtls-rprx-vision";
     if (!parseRealityTlsConfig(uri, config.reality, error)) return false;
     config.reality.alpn = {"h2", "http/1.1"};
     return true;
@@ -106,14 +108,18 @@ bool makeHeader(const VisionConfig& config, const std::string& destination,
         error = L"VLESS Vision получил некорректный адрес назначения";
         return false;
     }
-    static constexpr std::string_view flow = "xtls-rprx-vision";
     output = {0};
     output.insert(output.end(), config.id.begin(), config.id.end());
-    // protobuf Addons { string Flow = 1; }
-    output.push_back(static_cast<unsigned char>(flow.size() + 2));
-    output.push_back(0x0a);
-    output.push_back(static_cast<unsigned char>(flow.size()));
-    output.insert(output.end(), flow.begin(), flow.end());
+    if (config.vision) {
+        static constexpr std::string_view flow = "xtls-rprx-vision";
+        // protobuf Addons { string Flow = 1; }
+        output.push_back(static_cast<unsigned char>(flow.size() + 2));
+        output.push_back(0x0a);
+        output.push_back(static_cast<unsigned char>(flow.size()));
+        output.insert(output.end(), flow.begin(), flow.end());
+    } else {
+        output.push_back(0); // Empty protobuf Addons for ordinary VLESS TCP.
+    }
     output.push_back(1);
     output.push_back(static_cast<unsigned char>(port >> 8));
     output.push_back(static_cast<unsigned char>(port));
@@ -291,7 +297,8 @@ struct VlessVisionClient::Impl {
                 std::wstring currentError;
                 bool received = direct ? tls->readRaw(input, currentError) : tls->read(input, currentError);
                 if (!received) {
-                    if (!stopping && !(responseHeader && decoder.atBlockBoundary()))
+                    if (!stopping && !(responseHeader &&
+                            (!config.vision || decoder.atBlockBoundary())))
                         readerError = std::move(currentError);
                     break;
                 }
@@ -305,7 +312,12 @@ struct VlessVisionClient::Impl {
                     responseHeader = true;
                     if (input.empty()) continue;
                 }
-                if (!decoder.consume(input, local, direct, readerError)) break;
+                if (config.vision) {
+                    if (!decoder.consume(input, local, direct, readerError)) break;
+                } else if (!input.empty() && !sendAll(local, input.data(), input.size())) {
+                    readerError = L"Локальное приложение закрыло соединение";
+                    break;
+                }
             }
             readerDone = true;
             shutdown(local, SD_BOTH);
@@ -315,9 +327,13 @@ struct VlessVisionClient::Impl {
         bool okay = count > 0;
         if (!okay) error = L"Локальное приложение закрыло соединение до отправки данных";
         if (okay) {
-            auto first = visionFirstBlock(config,
-                std::span<const unsigned char>(buffer.data(), static_cast<size_t>(count)));
-            header.insert(header.end(), first.begin(), first.end());
+            if (config.vision) {
+                auto first = visionFirstBlock(config,
+                    std::span<const unsigned char>(buffer.data(), static_cast<size_t>(count)));
+                header.insert(header.end(), first.begin(), first.end());
+            } else {
+                header.insert(header.end(), buffer.begin(), buffer.begin() + count);
+            }
             okay = tls->write(header, error);
         }
         while (okay && !stopping && !readerDone) {
@@ -363,12 +379,18 @@ std::unique_ptr<VlessVisionClient> VlessVisionClient::connect(const std::wstring
     shutdown(application, SD_BOTH); closesocket(application); worker.join();
     if (received < 5 || !std::string_view(response.data(), static_cast<size_t>(received)).starts_with("HTTP/")) {
         client->stop();
-        result.message = relayError.empty() ? L"VLESS Vision не передал контрольный HTTP-ответ" : relayError;
+        result.message = relayError.empty()
+            ? (client->implementation_->config.vision
+                ? L"VLESS Vision не передал контрольный HTTP-ответ"
+                : L"VLESS TCP/REALITY не передал контрольный HTTP-ответ")
+            : relayError;
         return nullptr;
     }
     result.connected = true;
     result.udpEnabled = false;
-    result.message = L"VLESS TCP/REALITY Vision проверен — TCP работает";
+    result.message = client->implementation_->config.vision
+        ? L"VLESS TCP/REALITY Vision проверен — TCP работает"
+        : L"VLESS TCP/REALITY проверен — TCP работает";
     return client;
 }
 

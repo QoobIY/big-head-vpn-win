@@ -20,6 +20,7 @@ enum class ProfileKind {
     Hysteria2,
     VlessXhttpTls,
     VlessGrpcTls,
+    VlessTcpReality,
     VlessVisionReality,
     VlessGrpcReality,
     Unsupported

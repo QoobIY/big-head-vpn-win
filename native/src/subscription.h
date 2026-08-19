@@ -13,4 +13,4 @@ struct SubscriptionResult {
 
 SubscriptionResult downloadSubscription(const std::wstring& url);
 std::vector<Profile> parseSubscriptionText(const std::string& body);
-
+std::wstring normalizeProfileUri(std::wstring uri);
