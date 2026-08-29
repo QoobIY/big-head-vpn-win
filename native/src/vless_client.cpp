@@ -413,6 +413,10 @@ public:
             }
         }
         changed_.notify_all();
+        // Abort socket I/O before joining.  The keepalive thread can be
+        // inside a blocking send for up to SO_SNDTIMEO, which otherwise
+        // makes an ordinary disconnect take many seconds.
+        tls_.shutdownTransport();
         if (keepalive_.joinable()) keepalive_.join();
         {
             std::lock_guard lock(mutex_);
@@ -421,9 +425,8 @@ public:
                 if (stream->download && stream->local != INVALID_SOCKET) shutdown(stream->local, SD_BOTH);
             }
         }
-        // Wake the blocking recv first.  Schannel state remains alive until
-        // the reader exits, so DecryptMessage cannot race DeleteSecurityContext.
-        tls_.shutdownTransport();
+        // Schannel state remains alive until the reader exits, so
+        // DecryptMessage cannot race DeleteSecurityContext.
         if (reader_.joinable()) reader_.join();
         if (session_) { nghttp2_session_del(session_); session_ = nullptr; }
         tls_.close();

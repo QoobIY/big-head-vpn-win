@@ -39,6 +39,7 @@ constexpr UINT WM_SUBSCRIPTION_READY = WM_APP + 10;
 constexpr UINT WM_CONNECT_READY = WM_APP + 11;
 constexpr UINT WM_TRAY = WM_APP + 12;
 constexpr UINT WM_TUNNEL_ERROR = WM_APP + 13;
+constexpr UINT WM_DISCONNECT_READY = WM_APP + 14;
 constexpr UINT_PTR FILTER_STATUS_TIMER = 1;
 constexpr int IDR_MANROPE = 101;
 constexpr UINT TRAY_ICON_ID = 1;
@@ -56,6 +57,10 @@ struct ConnectPayload {
     std::unique_ptr<TunnelClient> session;
 };
 
+struct DisconnectPayload {
+    std::wstring reconnectProfileId;
+};
+
 struct App {
     HWND window{};
     HWND banner{}, status{}, connect{}, groups{}, profiles{}, url{}, add{}, update{}, remove{};
@@ -68,9 +73,11 @@ struct App {
     AppModel model;
     bool busy{};
     bool connecting{};
+    bool disconnecting{};
     bool autostartEnabled{};
     bool trayAdded{};
     bool exiting{};
+    HICON trayStatusIcon{};
     std::unique_ptr<TunnelClient> session;
     std::unique_ptr<SocksServer> socks;
     std::unique_ptr<ProcessFilter> processFilter;
@@ -81,6 +88,72 @@ App app;
 
 void updateTrayIcon();
 
+HICON createTrayStatusIcon(COLORREF statusColor) {
+    const int width = std::max(16, GetSystemMetrics(SM_CXSMICON));
+    const int height = std::max(16, GetSystemMetrics(SM_CYSMICON));
+    BITMAPV5HEADER header{};
+    header.bV5Size = sizeof(header);
+    header.bV5Width = width;
+    header.bV5Height = -height;
+    header.bV5Planes = 1;
+    header.bV5BitCount = 32;
+    header.bV5Compression = BI_BITFIELDS;
+    header.bV5RedMask = 0x00ff0000;
+    header.bV5GreenMask = 0x0000ff00;
+    header.bV5BlueMask = 0x000000ff;
+    header.bV5AlphaMask = 0xff000000;
+
+    HDC screen = GetDC(nullptr);
+    void* rawPixels{};
+    HBITMAP color = CreateDIBSection(screen, reinterpret_cast<BITMAPINFO*>(&header),
+        DIB_RGB_COLORS, &rawPixels, nullptr, 0);
+    HBITMAP mask = CreateBitmap(width, height, 1, 1, nullptr);
+    HDC canvas = CreateCompatibleDC(screen);
+    ReleaseDC(nullptr, screen);
+    if (!color || !mask || !canvas || !rawPixels) {
+        if (canvas) DeleteDC(canvas);
+        if (color) DeleteObject(color);
+        if (mask) DeleteObject(mask);
+        return nullptr;
+    }
+
+    HGDIOBJ previous = SelectObject(canvas, color);
+    HICON base = reinterpret_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr),
+        MAKEINTRESOURCEW(1), IMAGE_ICON, width, height, LR_DEFAULTCOLOR));
+    if (base) {
+        DrawIconEx(canvas, 0, 0, base, width, height, 0, nullptr, DI_NORMAL);
+        DestroyIcon(base);
+    }
+
+    auto* pixels = static_cast<uint32_t*>(rawPixels);
+    const int radius = std::max(3, width / 5);
+    const int centerX = width - radius;
+    const int centerY = height - radius;
+    const int borderRadiusSquared = radius * radius;
+    const int fillRadius = std::max(1, radius - 2);
+    const int fillRadiusSquared = fillRadius * fillRadius;
+    const uint32_t fill = 0xff000000U | (static_cast<uint32_t>(GetRValue(statusColor)) << 16U) |
+        (static_cast<uint32_t>(GetGValue(statusColor)) << 8U) | GetBValue(statusColor);
+    for (int y = centerY - radius; y <= centerY + radius; ++y) {
+        for (int x = centerX - radius; x <= centerX + radius; ++x) {
+            if (x < 0 || y < 0 || x >= width || y >= height) continue;
+            const int distance = (x - centerX) * (x - centerX) + (y - centerY) * (y - centerY);
+            if (distance <= borderRadiusSquared)
+                pixels[y * width + x] = distance <= fillRadiusSquared ? fill : 0xff111318U;
+        }
+    }
+
+    SelectObject(canvas, previous);
+    DeleteDC(canvas);
+    ICONINFO info{};
+    info.hbmColor = color;
+    info.hbmMask = mask;
+    HICON result = CreateIconIndirect(&info);
+    DeleteObject(color);
+    DeleteObject(mask);
+    return result;
+}
+
 void restoreWindow() {
     if (IsIconic(app.window)) ShowWindow(app.window, SW_RESTORE);
     else ShowWindow(app.window, SW_SHOW);
@@ -88,13 +161,18 @@ void restoreWindow() {
 }
 
 void removeTrayIcon() {
-    if (!app.trayAdded) return;
-    NOTIFYICONDATAW icon{};
-    icon.cbSize = sizeof(icon);
-    icon.hWnd = app.window;
-    icon.uID = TRAY_ICON_ID;
-    Shell_NotifyIconW(NIM_DELETE, &icon);
-    app.trayAdded = false;
+    if (app.trayAdded) {
+        NOTIFYICONDATAW icon{};
+        icon.cbSize = sizeof(icon);
+        icon.hWnd = app.window;
+        icon.uID = TRAY_ICON_ID;
+        Shell_NotifyIconW(NIM_DELETE, &icon);
+        app.trayAdded = false;
+    }
+    if (app.trayStatusIcon) {
+        DestroyIcon(app.trayStatusIcon);
+        app.trayStatusIcon = nullptr;
+    }
 }
 
 void updateTrayIcon() {
@@ -104,8 +182,15 @@ void updateTrayIcon() {
     icon.uID = TRAY_ICON_ID;
     icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     icon.uCallbackMessage = WM_TRAY;
-    icon.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1));
-    const wchar_t* tip = app.session ? L"Big Head VPN — подключено" : L"Big Head VPN — отключено";
+    HICON previousIcon = app.trayStatusIcon;
+    const COLORREF statusColor = (app.connecting || app.disconnecting) ? RGB(245, 158, 11)
+        : app.session ? RGB(34, 197, 94) : RGB(113, 119, 132);
+    app.trayStatusIcon = createTrayStatusIcon(statusColor);
+    icon.hIcon = app.trayStatusIcon ? app.trayStatusIcon
+                                   : LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1));
+    const wchar_t* tip = app.disconnecting ? L"Big Head VPN — отключение…"
+        : app.connecting ? L"Big Head VPN — подключение…"
+        : app.session ? L"Big Head VPN — подключено" : L"Big Head VPN — отключено";
     wcsncpy_s(icon.szTip, tip, _TRUNCATE);
     if (!app.trayAdded) {
         app.trayAdded = Shell_NotifyIconW(NIM_ADD, &icon) != FALSE;
@@ -116,13 +201,15 @@ void updateTrayIcon() {
     } else {
         Shell_NotifyIconW(NIM_MODIFY, &icon);
     }
+    if (previousIcon) DestroyIcon(previousIcon);
 }
 
 void showTrayMenu(POINT point) {
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
     AppendMenuW(menu, MF_STRING | MF_DEFAULT, ID_TRAY_OPEN, L"Открыть Big Head VPN");
-    AppendMenuW(menu, MF_STRING, ID_TRAY_TOGGLE, app.session ? L"Отключить VPN" : L"Подключить VPN");
+    AppendMenuW(menu, MF_STRING | (app.disconnecting ? MF_GRAYED : 0), ID_TRAY_TOGGLE,
+        app.disconnecting ? L"Отключение VPN…" : app.session ? L"Отключить VPN" : L"Подключить VPN");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, L"Выход");
     SetForegroundWindow(app.window);
@@ -261,7 +348,7 @@ void addSubscriptionOrProfile(const std::wstring& input) {
 }
 
 void beginConnect(const std::wstring& profileId) {
-    if (app.connecting || app.session) return;
+    if (app.connecting || app.disconnecting || app.session) return;
     auto selected = std::find_if(app.model.profiles.begin(), app.model.profiles.end(),
         [&](const auto& profile) { return profile.id == profileId; });
     if (selected == app.model.profiles.end()) {
@@ -272,6 +359,7 @@ void beginConnect(const std::wstring& profileId) {
     app.connecting = true;
     EnableWindow(app.connect, FALSE);
     SetWindowTextW(app.connect, L"Подключение…");
+    updateTrayIcon();
     switch (kind) {
     case ProfileKind::VlessXhttpTls:
         showBanner(L"Проверяю VLESS XHTTP/TLS…");
@@ -301,6 +389,32 @@ void beginConnect(const std::wstring& profileId) {
         auto payload = std::make_unique<ConnectPayload>();
         payload->session = connectTunnel(uri, payload->result);
         PostMessageW(target, WM_CONNECT_READY, 0, reinterpret_cast<LPARAM>(payload.release()));
+    }).detach();
+}
+
+void beginDisconnect(std::wstring reconnectProfileId = {}) {
+    if (app.disconnecting || !app.session) return;
+    app.disconnecting = true;
+    SetWindowTextW(app.connect, L"Отключение…");
+    EnableWindow(app.connect, FALSE);
+    EnableWindow(app.profiles, FALSE);
+    updateTrayIcon();
+
+    HWND target = app.window;
+    std::thread([target, reconnectProfileId = std::move(reconnectProfileId),
+                    processFilter = std::move(app.processFilter),
+                    socks = std::move(app.socks), session = std::move(app.session)]() mutable {
+        // Stop the tunnel first so blocked relay calls wake up, then join the
+        // SOCKS/WinDivert workers while the TunnelClient is still alive.
+        session->stop();
+        processFilter.reset();
+        socks.reset();
+        session.reset();
+        auto payload = std::make_unique<DisconnectPayload>();
+        payload->reconnectProfileId = std::move(reconnectProfileId);
+        if (PostMessageW(target, WM_DISCONNECT_READY, 0,
+                reinterpret_cast<LPARAM>(payload.get())))
+            payload.release();
     }).detach();
 }
 
@@ -692,10 +806,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 size_t index = static_cast<size_t>(SendMessageW(app.profiles, LB_GETITEMDATA, selected, 0));
                 app.model.selectedProfileId = app.model.profiles[index].id; app.model.save(); SetWindowTextW(app.status, app.model.profiles[index].name.c_str());
                 if (app.session) {
-                    app.session->stop(); app.processFilter.reset(); app.socks.reset(); app.session.reset(); SetWindowTextW(app.connect, L"Подключить");
-                    updateTrayIcon();
-                    appendLog(L"Старый туннель остановлен при смене сервера");
-                    beginConnect(app.model.profiles[index].id);
+                    appendLog(L"Останавливаю старый туннель при смене сервера");
+                    beginDisconnect(app.model.profiles[index].id);
                 }
             }
         } else if (id == ID_GROUPS && notification == CBN_SELCHANGE) {
@@ -703,15 +815,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         } else if (id == ID_CONNECT) {
             saveListenerFields();
             if (app.session) {
-                SetWindowTextW(app.connect, L"Отключение…"); EnableWindow(app.connect, FALSE);
-                app.session->stop();
-                app.processFilter.reset();
-                app.socks.reset();
-                app.session.reset();
-                updateTrayIcon();
-                updateFilterStatus();
-                SetWindowTextW(app.connect, L"Подключить"); EnableWindow(app.connect, TRUE);
-                showBanner(L"VPN отключён"); appendLog(L"Соединение остановлено");
+                beginDisconnect();
                 return 0;
             }
             auto selected = std::find_if(app.model.profiles.begin(), app.model.profiles.end(), [&](const auto& item) { return item.id == app.model.selectedProfileId; });
@@ -790,6 +894,22 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             updateTrayIcon();
             showBanner(payload->result.message.empty() ? L"VPN не подключился" : payload->result.message, true);
             appendLog(L"Ошибка подключения: " + payload->result.message);
+        }
+        return 0;
+    }
+    case WM_DISCONNECT_READY: {
+        std::unique_ptr<DisconnectPayload> payload(reinterpret_cast<DisconnectPayload*>(lParam));
+        app.disconnecting = false;
+        updateTrayIcon();
+        updateFilterStatus();
+        SetWindowTextW(app.connect, L"Подключить");
+        EnableWindow(app.connect, TRUE);
+        EnableWindow(app.profiles, TRUE);
+        showBanner(L"VPN отключён");
+        appendLog(L"Соединение остановлено");
+        if (payload && !payload->reconnectProfileId.empty()) {
+            appendLog(L"Подключаю выбранный сервер");
+            beginConnect(payload->reconnectProfileId);
         }
         return 0;
     }
