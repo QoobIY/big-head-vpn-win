@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Differential end-to-end test:
+# Differential end-to-end test using a local TLS 1.3 camouflage target:
 #   official Xray client -> official Xray server -> HTTP
 #   BigHeadVPN client    -> official Xray server -> HTTP
 #
@@ -20,6 +20,8 @@ if [[ ! -f "$probe_bin" ]]; then
     echo "Probe not found: $probe_bin" >&2
     exit 2
 fi
+
+command -v openssl >/dev/null || { echo "openssl is required for the local TLS fixture" >&2; exit 1; }
 
 oracle_dir="$(mktemp -d /tmp/bhvpn-vision-oracle.XXXXXX)"
 server_pid=""
@@ -105,6 +107,14 @@ JSON
 python3 -m http.server 28080 --bind 127.0.0.1 \
     >"$oracle_dir/origin.log" 2>&1 &
 origin_pid=$!
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$oracle_dir/target.key" -out "$oracle_dir/target.crt" -days 1 -subj '/CN=www.cloudflare.com' >/dev/null 2>&1
+python3 - "$oracle_dir" <<'LOCAL_TARGET'
+import json,sys,pathlib
+root=pathlib.Path(sys.argv[1]);p=root/'server.json';c=json.loads(p.read_text())
+c['inbounds'][0]['streamSettings']['realitySettings']['target']='127.0.0.1:2444'
+c['inbounds'].append({'listen':'127.0.0.1','port':2444,'protocol':'dokodemo-door','settings':{'address':'127.0.0.1','port':8080,'network':'tcp'},'streamSettings':{'network':'tcp','security':'tls','tlsSettings':{'minVersion':'1.3','alpn':['h2','http/1.1'],'certificates':[{'certificateFile':str(root/'target.crt'),'keyFile':str(root/'target.key')}]}}})
+p.write_text(json.dumps(c))
+LOCAL_TARGET
 "$xray_bin" run -c "$oracle_dir/server.json" >"$oracle_dir/server.log" 2>&1 &
 server_pid=$!
 "$xray_bin" run -c "$oracle_dir/control.json" >"$oracle_dir/control.log" 2>&1 &
@@ -121,6 +131,17 @@ if [[ "$official_code" != "200" ]]; then
 fi
 
 native_uri="vless://00112233-4455-6677-8899-aabbccddeeff@${wsl_address}:2443?type=tcp&security=reality&flow=xtls-rprx-vision&sni=www.cloudflare.com&pbk=cdll8azvosFOYo1429d1eoZ1_Li7sEXr7_3KNIyNlB0&sid=0123456789abcdef#oracle"
+"$probe_bin" --reality-tls-uri "$native_uri" >"$oracle_dir/handshake.log" 2>&1
+if ! grep -q 'reality_tls_ok kex=X25519MLKEM768' "$oracle_dir/handshake.log"; then
+    echo "Native hybrid TLS handshake failed" >&2
+    cat "$oracle_dir/handshake.log" >&2
+    exit 1
+fi
+invalid_uri="${native_uri/sid=0123456789abcdef/sid=ffffffffffffffff}"
+if "$probe_bin" --reality-tls-uri "$invalid_uri" >"$oracle_dir/rejection.log" 2>&1; then
+    echo "Invalid REALITY credentials were accepted" >&2
+    exit 1
+fi
 "$probe_bin" --socks-uri "$native_uri" 2098 >"$oracle_dir/probe.log" 2>&1 &
 probe_pid=$!
 for attempt in {1..15}; do
@@ -145,4 +166,4 @@ if [[ "$native_code" != "$official_code" ]]; then
     exit 1
 fi
 
-echo "VLESS Vision oracle passed: official=$official_code native=$native_code"
+echo "VLESS Vision hybrid oracle passed (invalid credentials rejected): official=$official_code native=$native_code"

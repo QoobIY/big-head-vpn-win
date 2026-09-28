@@ -33,10 +33,12 @@ struct AppModel {
     std::wstring listenAddress = L"127.0.0.1";
     unsigned short listenPort = 2080;
     std::vector<std::wstring> filteredProcesses;
+    bool processRoutingEnabled = false;
 
     bool load();
     bool save() const;
     void replaceGroup(const SubscriptionGroup& group, std::vector<Profile> incoming);
+    void deleteProfile(const std::wstring& profileId);
     void deleteGroup(const std::wstring& groupId);
 };
 

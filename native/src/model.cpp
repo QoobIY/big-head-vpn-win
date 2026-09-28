@@ -199,6 +199,7 @@ std::wstring profileName(const std::wstring& uri) {
 
 bool AppModel::load() {
     groups.clear(); profiles.clear(); selectedProfileId.clear(); filteredProcesses.clear();
+    processRoutingEnabled = false;
     auto file = dataDirectory() / L"settings.dat";
     std::ifstream input(file, std::ios::binary);
     if (!input) return true;
@@ -216,6 +217,7 @@ bool AppModel::load() {
         if (f.size() == 4 && f[0] == "G") groups.push_back({unescape(f[1]), unescape(f[2]), unescape(f[3])});
         else if (f.size() == 5 && f[0] == "P") profiles.push_back({unescape(f[1]), unescape(f[2]), unescape(f[3]), unescape(f[4])});
         else if (f.size() == 2 && f[0] == "S") selectedProfileId = unescape(f[1]);
+        else if (f.size() == 2 && f[0] == "R") processRoutingEnabled = f[1] == "1";
         else if (f.size() == 2 && f[0] == "F") filteredProcesses.push_back(unescape(f[1]));
         else if (f.size() == 3 && f[0] == "L") {
             listenAddress = unescape(f[1]);
@@ -234,6 +236,7 @@ bool AppModel::save() const {
     content << "S|" << escape(selectedProfileId) << '\n';
     content << "L|" << escape(listenAddress) << '|' << listenPort << '\n';
     for (const auto& process : filteredProcesses) content << "F|" << escape(process) << '\n';
+    content << "R|" << (processRoutingEnabled ? "1" : "0") << '\n';
     auto plain = content.str();
     DATA_BLOB in{static_cast<DWORD>(plain.size()), reinterpret_cast<BYTE*>(plain.data())}, out{};
     if (!CryptProtectData(&in, L"Big Head VPN settings", nullptr, nullptr, nullptr,
@@ -270,4 +273,9 @@ void AppModel::deleteGroup(const std::wstring& groupId) {
     groups.erase(std::remove_if(groups.begin(), groups.end(), [&](const auto& item) { return item.id == groupId; }), groups.end());
     profiles.erase(std::remove_if(profiles.begin(), profiles.end(), [&](const auto& item) { return item.groupId == groupId; }), profiles.end());
     if (std::none_of(profiles.begin(), profiles.end(), [&](const auto& item) { return item.id == selectedProfileId; })) selectedProfileId.clear();
+}
+
+void AppModel::deleteProfile(const std::wstring& profileId) {
+    std::erase_if(profiles, [&](const auto& profile) { return profile.id == profileId; });
+    if (selectedProfileId == profileId) selectedProfileId.clear();
 }

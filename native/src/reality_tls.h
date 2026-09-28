@@ -32,6 +32,7 @@ public:
     void shutdownTransport();
     void close();
     std::string negotiatedAlpn() const;
+    std::string negotiatedKeyExchange() const;
 
 private:
     struct Impl;

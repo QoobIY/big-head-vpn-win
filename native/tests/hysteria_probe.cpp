@@ -76,7 +76,7 @@ int wmain(int argc, wchar_t** argv) {
         config.alpn = {"h2", "http/1.1"};
         RealityTls tls;
         bool connected = tls.connect(config, error);
-        std::cout << (connected ? "reality_tls_ok alpn=" + tls.negotiatedAlpn() :
+        std::cout << (connected ? "reality_tls_ok kex=" + tls.negotiatedKeyExchange() + " alpn=" + tls.negotiatedAlpn() :
             "reality_tls_failed " + utf8(error)) << std::endl;
         tls.close();
         WSACleanup();

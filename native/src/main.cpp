@@ -32,7 +32,7 @@ enum ControlId {
     ID_CONNECT = 100, ID_GROUPS, ID_PROFILES, ID_URL, ID_ADD_SUBSCRIPTION,
     ID_UPDATE_GROUP, ID_DELETE_GROUP, ID_LOG, ID_COPY_LOG, ID_CLEAR_LOG,
     ID_ADDRESS, ID_PORT, ID_RUNNING_PROCESSES, ID_SELECTED_PROCESSES,
-    ID_REFRESH_PROCESSES, ID_ADD_PROCESS, ID_REMOVE_PROCESS, ID_AUTOSTART,
+    ID_REFRESH_PROCESSES, ID_ADD_PROCESS, ID_REMOVE_PROCESS, ID_AUTOSTART, ID_PROCESS_ROUTING, ID_DELETE_PROFILE,
     ID_TRAY_OPEN = 200, ID_TRAY_TOGGLE, ID_TRAY_EXIT
 };
 constexpr UINT WM_SUBSCRIPTION_READY = WM_APP + 10;
@@ -66,11 +66,12 @@ struct App {
     HWND banner{}, status{}, connect{}, groups{}, profiles{}, url{}, add{}, update{}, remove{};
     HWND log{}, address{}, port{};
     HWND runningProcesses{}, selectedProcesses{}, refreshProcesses{}, addProcess{}, removeProcess{};
-    HWND filterStatus{}, autostart{};
+    HWND filterStatus{}, autostart{}, processRouting{}, removeProfile{};
     HFONT regular{}, medium{}, title{}, small{};
     HBRUSH background{}, card{}, input{};
     HANDLE fontResource{};
     AppModel model;
+    std::wstring activeProfileId;
     bool busy{};
     bool connecting{};
     bool disconnecting{};
@@ -288,7 +289,13 @@ void refillProfiles() {
         size_t index = static_cast<size_t>(SendMessageW(app.profiles, LB_GETITEMDATA, selected, 0));
         app.model.selectedProfileId = app.model.profiles[index].id;
         SetWindowTextW(app.status, app.model.profiles[index].name.c_str());
-    } else SetWindowTextW(app.status, L"Добавьте подписку и выберите сервер");
+    } else {
+        app.model.selectedProfileId.clear();
+        SetWindowTextW(app.status, L"Добавьте подписку или отдельный сервер");
+    }
+    EnableWindow(app.removeProfile, selected >= 0);
+    EnableWindow(app.remove, selectedGroup > 0);
+    EnableWindow(app.update, selectedGroup > 0);
 }
 
 void refillGroups() {
@@ -355,6 +362,7 @@ void beginConnect(const std::wstring& profileId) {
         showBanner(L"Выбранный сервер больше не существует", true);
         return;
     }
+    app.activeProfileId = selected->id;
     const ProfileKind kind = profileKind(selected->uri);
     app.connecting = true;
     EnableWindow(app.connect, FALSE);
@@ -471,7 +479,7 @@ void processSelectionChanged(const std::wstring& message) {
     app.model.save();
     refillSelectedProcesses();
     updateFilterStatus();
-    if (app.session) showBanner(message + L". Переподключите VPN, чтобы применить список");
+    if (app.session && app.model.processRoutingEnabled) showBanner(message + L". Переподключите VPN, чтобы применить список");
     else showBanner(message);
 }
 
@@ -494,7 +502,9 @@ void removeSelectedProcess() {
 
 void updateFilterStatus(bool writeLog) {
     if (!app.processFilter) {
-        SetWindowTextW(app.filterStatus, app.model.filteredProcesses.empty()
+        SetWindowTextW(app.filterStatus, !app.model.processRoutingEnabled
+            ? L"Выключено — работает только локальный прокси"
+            : app.model.filteredProcesses.empty()
             ? L"Не выбрано — доступен только локальный SOCKS5"
             : L"Список сохранён — фильтр запустится при подключении");
         return;
@@ -562,15 +572,18 @@ void layout(int width, int height) {
     MoveWindow(app.profiles, contentX + 20, top + 190, leftW - 40, listH, TRUE);
     MoveWindow(app.url, contentX + 20, top + 202 + listH, leftW - 158, 38, TRUE);
     MoveWindow(app.add, contentX + leftW - 128, top + 202 + listH, 108, 38, TRUE);
-    MoveWindow(app.update, contentX + 20, top + 252 + listH, 122, 36, TRUE);
-    MoveWindow(app.remove, contentX + 152, top + 252 + listH, 136, 36, TRUE);
+    int actionWidth = (leftW - 56) / 3;
+    MoveWindow(app.update, contentX + 20, top + 252 + listH, actionWidth, 36, TRUE);
+    MoveWindow(app.removeProfile, contentX + 28 + actionWidth, top + 252 + listH, actionWidth, 36, TRUE);
+    MoveWindow(app.remove, contentX + 36 + actionWidth * 2, top + 252 + listH, actionWidth, 36, TRUE);
     MoveWindow(app.address, rightX + 20, top + 30, std::max(100, rightW - 146), 38, TRUE);
     MoveWindow(app.port, rightX + rightW - 114, top + 30, 94, 38, TRUE);
     int processListTop = top + 150;
     int processListHeight = std::clamp((height - top) * 28 / 100, 110, 180);
     int processWidth = (rightW - 50) / 2;
-    MoveWindow(app.refreshProcesses, rightX + rightW - 116, top + 82, 96, 32, TRUE);
-    MoveWindow(app.filterStatus, rightX + 20, top + 102, rightW - 40, 24, TRUE);
+    MoveWindow(app.processRouting, rightX + 20, top + 77, rightW - 40, 26, TRUE);
+    MoveWindow(app.refreshProcesses, rightX + rightW - 106, top + 105, 86, 28, TRUE);
+    MoveWindow(app.filterStatus, rightX + 20, top + 106, rightW - 136, 24, TRUE);
     MoveWindow(app.runningProcesses, rightX + 20, processListTop, processWidth, processListHeight, TRUE);
     MoveWindow(app.selectedProcesses, rightX + 30 + processWidth, processListTop, processWidth, processListHeight, TRUE);
     MoveWindow(app.addProcess, rightX + 20, processListTop + processListHeight + 8, processWidth, 34, TRUE);
@@ -610,10 +623,9 @@ void paint(HDC dc, const RECT& client) {
     TextOutW(dc, 73, 48, subtitle, static_cast<int>(std::size(subtitle) - 1));
     label(dc, margin + 20, 247, L"СЕРВЕРЫ И ПОДПИСКИ");
     label(dc, rightX + 20, 143, L"ЛОКАЛЬНЫЙ PROXY: SOCKS5 + HTTP");
-    label(dc, rightX + 20, 213, L"ПРОЦЕССЫ ЧЕРЕЗ VPN");
     label(dc, rightX + 20, 258, L"ЗАПУЩЕННЫЕ");
     int processWidth = (right.right - right.left - 50) / 2;
-    label(dc, rightX + 30 + processWidth, 258, L"В VPN");
+    label(dc, rightX + 30 + processWidth, 258, L"ВЫБРАННЫЕ");
     int processListHeight = std::clamp(static_cast<int>((client.bottom - 126) * 28 / 100), 110, 180);
     label(dc, rightX + 20, 126 + 150 + processListHeight + 55, L"ЖУРНАЛ СОЕДИНЕНИЯ");
 }
@@ -651,18 +663,54 @@ void drawBanner(const DRAWITEMSTRUCT& item) {
 
 void drawChoice(const DRAWITEMSTRUCT& item) {
     if (item.itemID == static_cast<UINT>(-1)) return;
-    bool selected = (item.itemState & ODS_SELECTED) != 0;
-    COLORREF fill = selected ? RGB(45, 50, 69) : INPUT;
+    const int saved = SaveDC(item.hDC);
+    const bool selected = (item.itemState & ODS_SELECTED) != 0;
     FillRect(item.hDC, &item.rcItem, app.input);
-    RECT row = item.rcItem; InflateRect(&row, -2, -2);
-    if (selected) roundedBox(item.hDC, row, fill, fill, 8);
-    wchar_t text[1024]{};
-    if (item.CtlType == ODT_LISTBOX) SendMessageW(item.hwndItem, LB_GETTEXT, item.itemID, reinterpret_cast<LPARAM>(text));
-    else SendMessageW(item.hwndItem, CB_GETLBTEXT, item.itemID, reinterpret_cast<LPARAM>(text));
-    SetBkMode(item.hDC, TRANSPARENT); SetTextColor(item.hDC, selected ? TEXT : RGB(211, 215, 224));
-    SelectObject(item.hDC, selected ? app.medium : app.regular);
-    RECT textRect = item.rcItem; textRect.left += 12; textRect.right -= 8;
-    DrawTextW(item.hDC, text, -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    RECT row = item.rcItem; InflateRect(&row, -3, -3);
+    roundedBox(item.hDC, row, selected ? RGB(39, 51, 73) : RGB(29, 33, 43),
+               selected ? RGB(79, 137, 178) : RGB(36, 41, 53), 10);
+    SetBkMode(item.hDC, TRANSPARENT);
+    if (item.CtlID == ID_PROFILES && item.itemData < app.model.profiles.size()) {
+        const auto& profile = app.model.profiles[item.itemData];
+        const auto kind = profileKind(profile.uri);
+        const bool hysteria = kind == ProfileKind::Hysteria2;
+        const bool unsupported = kind == ProfileKind::Unsupported;
+        const wchar_t* badge = hysteria ? L"HY2" : unsupported ? L"ДРУГОЙ" : L"VLESS";
+        COLORREF tint = hysteria ? RGB(79, 211, 185) : unsupported ? RGB(210, 163, 95) : RGB(142, 170, 255);
+        RECT pill{row.right - 82, row.top + 9, row.right - 10, row.top + 31};
+        roundedBox(item.hDC, pill, hysteria ? RGB(28, 66, 63) : unsupported ? RGB(66, 51, 33) : RGB(44, 48, 78),
+                   selected ? tint : BORDER, 8);
+        SelectObject(item.hDC, app.small); SetTextColor(item.hDC, tint);
+        DrawTextW(item.hDC, badge, -1, &pill, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        RECT title{row.left + 13, row.top + 6, pill.left - 10, row.top + 31};
+        SelectObject(item.hDC, app.medium); SetTextColor(item.hDC, TEXT);
+        DrawTextW(item.hDC, profile.name.c_str(), -1, &title, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        std::wstring detail = profileKindName(kind);
+        if (profile.groupId.empty()) detail += L"  ·  Отдельный сервер";
+        else {
+            const auto group = std::find_if(app.model.groups.begin(), app.model.groups.end(),
+                [&](const auto& entry) { return entry.id == profile.groupId; });
+            if (group != app.model.groups.end()) detail += L"  ·  " + group->name;
+        }
+        RECT subtitle{row.left + 13, row.top + 33, row.right - 12, row.bottom - 5};
+        SelectObject(item.hDC, app.small); SetTextColor(item.hDC, MUTED);
+        DrawTextW(item.hDC, detail.c_str(), -1, &subtitle, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    } else {
+        const bool list = item.CtlType == ODT_LISTBOX;
+        const auto length = SendMessageW(item.hwndItem, list ? LB_GETTEXTLEN : CB_GETLBTEXTLEN, item.itemID, 0);
+        if (length >= 0) {
+            std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+            SendMessageW(item.hwndItem, list ? LB_GETTEXT : CB_GETLBTEXT, item.itemID, reinterpret_cast<LPARAM>(text.data()));
+            SelectObject(item.hDC, selected ? app.medium : app.regular);
+            SetTextColor(item.hDC, selected ? TEXT : RGB(211, 215, 224));
+            RECT textRect = row; textRect.left += 12; textRect.right -= 8;
+            DrawTextW(item.hDC, text.c_str(), -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+    }
+    if ((item.itemState & ODS_FOCUS) && !(item.itemState & ODS_NOFOCUSRECT)) {
+        RECT focus = row; InflateRect(&focus, -3, -3); DrawFocusRect(item.hDC, &focus);
+    }
+    RestoreDC(item.hDC, saved);
 }
 
 LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -697,10 +745,15 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         app.add = button(L"Добавить", ID_ADD_SUBSCRIPTION);
         app.update = button(L"Обновить", ID_UPDATE_GROUP);
         app.remove = button(L"Удалить группу", ID_DELETE_GROUP);
+        app.removeProfile = button(L"Удалить сервер", ID_DELETE_PROFILE);
+        setFont(app.update, app.small); setFont(app.remove, app.small); setFont(app.removeProfile, app.small);
         app.address = control(L"EDIT", app.model.listenAddress.c_str(), ES_AUTOHSCROLL, ID_ADDRESS);
         app.port = control(L"EDIT", std::to_wstring(app.model.listenPort).c_str(), ES_NUMBER, ID_PORT);
         SendMessageW(app.address, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(12, 12));
         SendMessageW(app.port, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(12, 12));
+        app.processRouting = control(L"BUTTON", L"Направлять выбранные процессы через VPN", BS_AUTOCHECKBOX | WS_TABSTOP, ID_PROCESS_ROUTING);
+        setFont(app.processRouting, app.small);
+        SendMessageW(app.processRouting, BM_SETCHECK, app.model.processRoutingEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
         app.refreshProcesses = button(L"Обновить", ID_REFRESH_PROCESSES);
         app.filterStatus = control(L"STATIC", L"", SS_LEFT | SS_CENTERIMAGE, 0); setFont(app.filterStatus, app.small);
         app.runningProcesses = control(L"LISTBOX", L"", LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT | WS_VSCROLL, ID_RUNNING_PROCESSES);
@@ -755,7 +808,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     }
     case WM_MEASUREITEM: {
         auto* measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
-        if (measure->CtlID == ID_PROFILES) measure->itemHeight = 32;
+        if (measure->CtlID == ID_PROFILES) measure->itemHeight = 68;
         else if (measure->CtlID == ID_RUNNING_PROCESSES || measure->CtlID == ID_SELECTED_PROCESSES) measure->itemHeight = 30;
         else if (measure->CtlID == ID_GROUPS) measure->itemHeight = 36;
         return TRUE;
@@ -789,6 +842,33 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 appendLog(L"Ошибка автозагрузки: " + error);
             }
         } else if (id == ID_ADD_SUBSCRIPTION) addSubscriptionOrProfile(windowText(app.url));
+        else if (id == ID_PROCESS_ROUTING && notification == BN_CLICKED) {
+            if (app.connecting || app.disconnecting) {
+                SendMessageW(app.processRouting, BM_SETCHECK, app.model.processRoutingEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+                showBanner(L"Дождитесь завершения подключения или отключения");
+                return 0;
+            }
+            app.model.processRoutingEnabled = SendMessageW(app.processRouting, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            app.model.save();
+            if (app.session) beginDisconnect(app.activeProfileId);
+            updateFilterStatus();
+            showBanner(app.model.processRoutingEnabled ? L"VPN для выбранных процессов включён" : L"VPN для процессов выключен");
+        }
+        else if (id == ID_DELETE_PROFILE) {
+            if (app.connecting || app.disconnecting || app.busy) {
+                showBanner(L"Дождитесь завершения текущей операции"); return 0;
+            }
+            int row = static_cast<int>(SendMessageW(app.profiles, LB_GETCURSEL, 0, 0));
+            if (row == LB_ERR) { showBanner(L"Выберите сервер для удаления", true); return 0; }
+            size_t index = static_cast<size_t>(SendMessageW(app.profiles, LB_GETITEMDATA, row, 0));
+            if (index >= app.model.profiles.size()) return 0;
+            const auto profile = app.model.profiles[index];
+            if (app.session && app.activeProfileId == profile.id) beginDisconnect();
+            app.model.deleteProfile(profile.id);
+            refillProfiles(); app.model.save();
+            appendLog(L"Удалён сервер: " + profile.name);
+            showBanner(profile.groupId.empty() ? L"Сервер удалён" : L"Сервер удалён. Обновление подписки может вернуть его");
+        }
         else if (id == ID_REFRESH_PROCESSES) refreshRunningProcesses();
         else if (id == ID_ADD_PROCESS || (id == ID_RUNNING_PROCESSES && notification == LBN_DBLCLK)) addSelectedProcess();
         else if (id == ID_REMOVE_PROCESS || (id == ID_SELECTED_PROCESSES && notification == LBN_DBLCLK)) removeSelectedProcess();
@@ -797,9 +877,20 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             if (selected <= 0 || static_cast<size_t>(selected - 1) >= app.model.groups.size()) showBanner(L"Выберите конкретную группу для обновления", true);
             else { const auto& group = app.model.groups[static_cast<size_t>(selected - 1)]; beginDownload(group.url, group.id); }
         } else if (id == ID_DELETE_GROUP) {
+            if (app.connecting || app.disconnecting || app.busy) {
+                showBanner(L"Дождитесь завершения текущей операции"); return 0;
+            }
             int selected = static_cast<int>(SendMessageW(app.groups, CB_GETCURSEL, 0, 0));
             if (selected <= 0 || static_cast<size_t>(selected - 1) >= app.model.groups.size()) showBanner(L"Выберите группу для удаления", true);
-            else { auto name = app.model.groups[static_cast<size_t>(selected - 1)].name; app.model.deleteGroup(app.model.groups[static_cast<size_t>(selected - 1)].id); app.model.save(); refillGroups(); appendLog(L"Удалена группа: " + name); showBanner(L"Группа удалена"); }
+            else {
+                const auto group = app.model.groups[static_cast<size_t>(selected - 1)];
+                const bool removesActive = std::any_of(app.model.profiles.begin(), app.model.profiles.end(),
+                    [&](const auto& profile) { return profile.groupId == group.id && profile.id == app.activeProfileId; });
+                if (app.session && removesActive) beginDisconnect();
+                app.model.deleteGroup(group.id);
+                refillGroups(); app.model.save();
+                appendLog(L"Удалена группа: " + group.name); showBanner(L"Группа удалена");
+            }
         } else if (id == ID_PROFILES && notification == LBN_SELCHANGE) {
             int selected = static_cast<int>(SendMessageW(app.profiles, LB_GETCURSEL, 0, 0));
             if (selected >= 0) {
@@ -866,7 +957,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 showBanner(listenerError, true); appendLog(L"Ошибка SOCKS5: " + listenerError);
                 return 0;
             }
-            if (!app.model.filteredProcesses.empty()) {
+            if (app.model.processRoutingEnabled && !app.model.filteredProcesses.empty()) {
                 app.lastMatched = app.lastRedirected = app.lastProxyReplies = app.lastAccepted = app.lastAcceptAttempts = app.lastNatMisses =
                     app.lastUdpMatched = app.lastUdpSent = app.lastUdpReceived = app.lastInjectionFailures = 0;
                 app.processFilter = ProcessFilter::start(app.model.filteredProcesses, *app.session, listenerError);

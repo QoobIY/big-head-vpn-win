@@ -20,6 +20,14 @@ target_include_directories(nghttp2_static PRIVATE "${NGHTTP2_DIR}/lib")
 target_compile_definitions(nghttp2_static PUBLIC NGHTTP2_STATICLIB)
 target_compile_options(nghttp2_static PRIVATE -Os -w -ffunction-sections -fdata-sections)
 
+set(PQCLEAN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/pqclean")
+file(GLOB MLKEM_SOURCES CONFIGURE_DEPENDS "${PQCLEAN_DIR}/crypto_kem/ml-kem-768/clean/*.c")
+add_library(mlkem768 STATIC ${MLKEM_SOURCES}
+    "${PQCLEAN_DIR}/common/fips202.c" "${PQCLEAN_DIR}/common/randombytes.c")
+target_include_directories(mlkem768 PUBLIC "${PQCLEAN_DIR}/crypto_kem/ml-kem-768/clean")
+target_include_directories(mlkem768 PRIVATE "${PQCLEAN_DIR}/common")
+target_compile_options(mlkem768 PRIVATE -Os -ffunction-sections -fdata-sections)
+
 set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
 set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
 set(USE_SHARED_MBEDTLS_LIBRARY OFF CACHE BOOL "" FORCE)
@@ -40,12 +48,17 @@ add_executable(BigHeadVPN WIN32
     src/vless_grpc_client.cpp
     src/vless_vision_client.cpp
     src/reality_tls.cpp
+    src/reality_hybrid.cpp
     src/schannel_tls.cpp
     src/socks_server.cpp
     src/process_filter.cpp
     src/autostart.cpp
     resources/app.rc
 )
+
+# Recompile Windows resources when the shared application icon changes.
+set_property(SOURCE resources/app.rc APPEND PROPERTY OBJECT_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/big-head-vpn.ico")
 
 target_include_directories(BigHeadVPN SYSTEM PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../.build-tools/msquic/include"
@@ -67,7 +80,7 @@ target_link_options(BigHeadVPN PRIVATE
     -Wl,--gc-sections -Wl,--strip-all
 )
 target_link_libraries(BigHeadVPN PRIVATE
-    lsqpack nghttp2_static mbedtls mbedx509 mbedcrypto advapi32 bcrypt comctl32 crypt32 dwmapi iphlpapi oleaut32 secur32 shell32 shlwapi taskschd uxtheme winhttp ws2_32
+    mlkem768 lsqpack nghttp2_static mbedtls mbedx509 mbedcrypto advapi32 bcrypt comctl32 crypt32 dwmapi iphlpapi oleaut32 secur32 shell32 shlwapi taskschd uxtheme winhttp ws2_32
 )
 
 add_executable(BigHeadVPNProbe
@@ -79,6 +92,7 @@ add_executable(BigHeadVPNProbe
     src/vless_grpc_client.cpp
     src/vless_vision_client.cpp
     src/reality_tls.cpp
+    src/reality_hybrid.cpp
     src/schannel_tls.cpp
     src/http2_connection.cpp
     src/socks_server.cpp
@@ -94,4 +108,12 @@ target_include_directories(BigHeadVPNProbe SYSTEM PRIVATE
 )
 target_include_directories(BigHeadVPNProbe PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_options(BigHeadVPNProbe PRIVATE -municode -static -static-libgcc -static-libstdc++ -Wl,--gc-sections -Wl,--strip-all)
-target_link_libraries(BigHeadVPNProbe PRIVATE lsqpack nghttp2_static mbedtls mbedx509 mbedcrypto advapi32 bcrypt iphlpapi oleaut32 secur32 taskschd winhttp ws2_32)
+target_link_libraries(BigHeadVPNProbe PRIVATE mlkem768 lsqpack nghttp2_static mbedtls mbedx509 mbedcrypto advapi32 bcrypt iphlpapi oleaut32 secur32 taskschd winhttp ws2_32)
+
+add_executable(BigHeadVPNHybridTest EXCLUDE_FROM_ALL
+    tests/reality_hybrid_test.cpp src/reality_hybrid.cpp)
+target_include_directories(BigHeadVPNHybridTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_compile_features(BigHeadVPNHybridTest PRIVATE cxx_std_20)
+target_compile_options(BigHeadVPNHybridTest PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(BigHeadVPNHybridTest PRIVATE -static -static-libgcc -static-libstdc++)
+target_link_libraries(BigHeadVPNHybridTest PRIVATE mlkem768 mbedcrypto bcrypt advapi32)

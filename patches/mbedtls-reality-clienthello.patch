@@ -1,6 +1,6 @@
 --- a/include/mbedtls/ssl.h
 +++ b/include/mbedtls/ssl.h
-@@ -1449,6 +1449,17 @@
+@@ -1449,6 +1449,21 @@
      void *p;                    /* typically a pointer to extra data */
  } mbedtls_ssl_user_data_t;
 
@@ -9,7 +9,11 @@
 +typedef int mbedtls_ssl_client_hello_transform_t(
 +    void *context, mbedtls_svc_key_id_t key_share_private_key,
 +    const unsigned char random[32], unsigned char *client_hello_body,
-+    size_t client_hello_body_length);
++    size_t *client_hello_body_length, size_t capacity);
++typedef int mbedtls_ssl_hybrid_key_exchange_t(
++    void *context, mbedtls_svc_key_id_t private_key,
++    const unsigned char *server_share, size_t server_share_length,
++    unsigned char shared_secret[64]);
 +typedef int mbedtls_ssl_server_certificate_auth_t(
 +    void *context, const unsigned char *certificate_der,
 +    size_t certificate_der_length);
@@ -18,21 +22,23 @@
  /**
   * SSL/TLS configuration to be shared between mbedtls_ssl_context structures.
   */
-@@ -1542,6 +1553,13 @@
+@@ -1541,6 +1556,15 @@
+     /** Callback for getting (pseudo-)random numbers                        */
      int(*MBEDTLS_PRIVATE(f_rng))(void *, unsigned char *, size_t);
      void *MBEDTLS_PRIVATE(p_rng);                    /*!< context for the RNG function       */
-
++
 +#if defined(MBEDTLS_SSL_PROTO_TLS1_3) && defined(MBEDTLS_SSL_CLI_C)
 +    mbedtls_ssl_client_hello_transform_t *MBEDTLS_PRIVATE(f_client_hello_transform);
 +    void *MBEDTLS_PRIVATE(p_client_hello_transform);
++    mbedtls_ssl_hybrid_key_exchange_t *MBEDTLS_PRIVATE(f_hybrid_key_exchange);
++    void *MBEDTLS_PRIVATE(p_hybrid_key_exchange);
 +    mbedtls_ssl_server_certificate_auth_t *MBEDTLS_PRIVATE(f_server_certificate_auth);
 +    void *MBEDTLS_PRIVATE(p_server_certificate_auth);
 +#endif
-+
+
      /** Callback to retrieve a session from the cache                       */
      mbedtls_ssl_cache_get_t *MBEDTLS_PRIVATE(f_get_cache);
-     /** Callback to store a session into the cache                          */
-@@ -2250,6 +2268,15 @@
+@@ -2250,6 +2274,18 @@
  void mbedtls_ssl_conf_verify(mbedtls_ssl_config *conf,
                               int (*f_vrfy)(void *, mbedtls_x509_crt *, int, uint32_t *),
                               void *p_vrfy);
@@ -40,6 +46,9 @@
 +#if defined(MBEDTLS_SSL_PROTO_TLS1_3) && defined(MBEDTLS_SSL_CLI_C)
 +void mbedtls_ssl_conf_client_hello_transform(
 +    mbedtls_ssl_config *conf, mbedtls_ssl_client_hello_transform_t *callback,
++    void *context);
++void mbedtls_ssl_conf_hybrid_key_exchange(
++    mbedtls_ssl_config *conf, mbedtls_ssl_hybrid_key_exchange_t *callback,
 +    void *context);
 +void mbedtls_ssl_conf_server_certificate_auth(
 +    mbedtls_ssl_config *conf, mbedtls_ssl_server_certificate_auth_t *callback,
@@ -50,7 +59,7 @@
  /**
 --- a/library/ssl_tls.c
 +++ b/library/ssl_tls.c
-@@ -1675,6 +1675,24 @@
+@@ -1675,6 +1675,32 @@
      conf->f_vrfy      = f_vrfy;
      conf->p_vrfy      = p_vrfy;
  }
@@ -62,6 +71,14 @@
 +{
 +    conf->f_client_hello_transform = callback;
 +    conf->p_client_hello_transform = context;
++}
++
++void mbedtls_ssl_conf_hybrid_key_exchange(
++    mbedtls_ssl_config *conf, mbedtls_ssl_hybrid_key_exchange_t *callback,
++    void *context)
++{
++    conf->f_hybrid_key_exchange = callback;
++    conf->p_hybrid_key_exchange = context;
 +}
 +
 +void mbedtls_ssl_conf_server_certificate_auth(
@@ -89,7 +106,7 @@
 +            ssl->conf->p_client_hello_transform,
 +            ssl->handshake->xxdh_psa_privkey,
 +            ssl->handshake->randbytes,
-+            buf, msg_len));
++            buf, &msg_len, buf_len));
 +        if (ssl->session_negotiate->id_len == 32 && buf[34] == 32) {
 +            memcpy(ssl->session_negotiate->id, buf + 35, 32);
 +        }
@@ -101,7 +118,16 @@
          ssl->out_msglen = msg_len + 4;
 --- a/library/ssl_misc.h
 +++ b/library/ssl_misc.h
-@@ -2654,6 +2654,13 @@
+@@ -942,6 +942,8 @@
+ #endif
+
+ #if defined(MBEDTLS_SSL_PROTO_TLS1_3)
++    unsigned char hybrid_shared_secret[64];
++    size_t hybrid_shared_secret_len;
+     uint16_t offered_group_id; /* The NamedGroup value for the group
+                                 * that is being used for ephemeral
+                                 * key exchange.
+@@ -2654,6 +2656,13 @@
      const uint16_t sig_alg)
  {
 
@@ -117,10 +143,11 @@
          return mbedtls_ssl_tls12_sig_alg_is_supported(sig_alg);
 --- a/library/ssl_tls13_generic.c
 +++ b/library/ssl_tls13_generic.c
-@@ -251,6 +251,15 @@
+@@ -250,6 +250,15 @@
+     MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
      algorithm = MBEDTLS_GET_UINT16_BE(p, 0);
      p += 2;
-
++
 +    if (ssl->conf->f_server_certificate_auth != NULL) {
 +        if (algorithm != MBEDTLS_TLS1_3_SIG_ED25519) goto error;
 +        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
@@ -129,10 +156,9 @@
 +        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, signature_len);
 +        return p + signature_len == end ? 0 : MBEDTLS_ERR_SSL_DECODE_ERROR;
 +    }
-+
+
      /* RFC 8446 section 4.4.3
       *
-      * If the CertificateVerify message is sent by a server, the signature
 @@ -521,8 +530,13 @@
          }
 
@@ -160,3 +186,56 @@
      /* Authmode: precedence order is SNI if used else configuration */
  #if defined(MBEDTLS_SSL_SRV_C) && defined(MBEDTLS_SSL_SERVER_NAME_INDICATION)
      const int authmode = ssl->handshake->sni_authmode != MBEDTLS_SSL_VERIFY_UNSET
+--- a/library/ssl_tls13_client.c
++++ b/library/ssl_tls13_client.c
+@@ -478,6 +478,24 @@
+     MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
+     group = MBEDTLS_GET_UINT16_BE(p, 0);
+     p += 2;
++
++    /* The application advertises X25519MLKEM768 through its ClientHello
++     * transform. Authenticate and decapsulate its complete server share before
++     * feeding the combined secret into the standard TLS 1.3 key schedule. */
++    if (group == 0x11ec && ssl->conf->f_hybrid_key_exchange != NULL) {
++        MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
++        if (MBEDTLS_GET_UINT16_BE(p, 0) != 1120 || end - p != 1122) {
++            return MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER;
++        }
++        ret = ssl->conf->f_hybrid_key_exchange(
++            ssl->conf->p_hybrid_key_exchange, ssl->handshake->xxdh_psa_privkey,
++            p + 2, 1120, ssl->handshake->hybrid_shared_secret);
++        if (ret != 0) {
++            return ret;
++        }
++        ssl->handshake->hybrid_shared_secret_len = 64;
++        return 0;
++    }
+
+     /* Check that the chosen group matches the one we offered. */
+     offered_group = ssl->handshake->offered_group_id;
+--- a/library/ssl_tls13_keys.c
++++ b/library/ssl_tls13_keys.c
+@@ -1478,7 +1478,22 @@
+      * client_handshake_traffic_secret and server_handshake_traffic_secret
+      * are derived in the handshake secret derivation stage.
+      */
+-    if (mbedtls_ssl_tls13_key_exchange_mode_with_ephemeral(ssl)) {
++    if (handshake->hybrid_shared_secret_len == 64) {
++        shared_secret_len = 64;
++        shared_secret = mbedtls_calloc(1, shared_secret_len);
++        if (shared_secret == NULL) {
++            return MBEDTLS_ERR_SSL_ALLOC_FAILED;
++        }
++        memcpy(shared_secret, handshake->hybrid_shared_secret, shared_secret_len);
++        mbedtls_platform_zeroize(handshake->hybrid_shared_secret, 64);
++        handshake->hybrid_shared_secret_len = 0;
++        psa_status_t status = psa_destroy_key(handshake->xxdh_psa_privkey);
++        if (status != PSA_SUCCESS) {
++            ret = PSA_TO_MBEDTLS_ERR(status);
++            goto cleanup;
++        }
++        handshake->xxdh_psa_privkey = MBEDTLS_SVC_KEY_ID_INIT;
++    } else if (mbedtls_ssl_tls13_key_exchange_mode_with_ephemeral(ssl)) {
+         if (mbedtls_ssl_tls13_named_group_is_ecdhe(handshake->offered_group_id) ||
+             mbedtls_ssl_tls13_named_group_is_ffdh(handshake->offered_group_id)) {
+ #if defined(PSA_WANT_ALG_ECDH) || defined(PSA_WANT_ALG_FFDH)

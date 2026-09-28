@@ -65,3 +65,21 @@ Xray используется только для тестов и в `dist` не
 VPN; двойной щелчок также добавляет или убирает строку. Подключите VPN, затем
 полностью перезапустите выбранные приложения: WinDivert не получает события
 сокетов, открытых до запуска фильтра.
+
+## Логотип
+
+Исходник: `assets/big-head-windows.svg`. Иконка `packaging/big-head-vpn.ico` используется в EXE, окне, шапке интерфейса и системном трее.
+
+После изменения SVG выполните `python3 scripts/generate-windows-icon.py` (Linux, библиотеки librsvg и libcairo), затем `bash scripts/build-native-windows-wsl.sh`. ICO содержит размеры от 16 до 256 пикселей.
+
+### Проверка REALITY X25519MLKEM768
+
+`cmake --build build/native-windows --target BigHeadVPNHybridTest` и
+`build/native-windows/BigHeadVPNHybridTest.exe` проверяют гибридный секрет,
+границы буферов, некорректную точку X25519 и повреждённый ML-KEM ciphertext.
+`scripts/test-vless-vision-oracle-wsl.sh /path/to/xray` сравнивает VLESS Vision
+с официальным Xray на локальном TLS-сервере (нужен `openssl`), проверяет выбор
+X25519MLKEM768 и отказ при неверном short ID. Xray используется только в тесте.
+
+Формат гибридного обмена: https://www.ietf.org/archive/id/draft-ietf-tls-ecdhe-mlkem-04.html
+Закреплённая реализация ML-KEM: `native/vendor/pqclean/UPSTREAM.md`.

@@ -65,7 +65,9 @@ if [[ ! -f "$NGHTTP2_DIR/lib/nghttp2_session.c" ]]; then
   tar -xJf "$NGHTTP2_ARCHIVE" --strip-components=1 -C "$NGHTTP2_DIR"
 fi
 
-if [[ ! -f "$MBEDTLS_DIR/.big-head-reality-patch" ]]; then
+MBEDTLS_PATCH_SHA256="$(sha256sum "$PROJECT_DIR/patches/mbedtls-reality-clienthello.patch" | cut -d ' ' -f 1)"
+if [[ ! -f "$MBEDTLS_DIR/.big-head-reality-patch" ]] || \
+   [[ "$(cat "$MBEDTLS_DIR/.big-head-reality-patch")" != "$MBEDTLS_PATCH_SHA256" ]]; then
   command -v patch >/dev/null || { echo "Не найден patch."; exit 1; }
   echo "Скачиваю закреплённый Mbed TLS $MBEDTLS_VERSION..."
   if [[ ! -f "$MBEDTLS_ARCHIVE" ]]; then
@@ -76,7 +78,7 @@ if [[ ! -f "$MBEDTLS_DIR/.big-head-reality-patch" ]]; then
   mkdir -p "$MBEDTLS_DIR"
   tar -xjf "$MBEDTLS_ARCHIVE" --strip-components=1 -C "$MBEDTLS_DIR"
   patch -d "$MBEDTLS_DIR" -p1 < "$PROJECT_DIR/patches/mbedtls-reality-clienthello.patch"
-  touch "$MBEDTLS_DIR/.big-head-reality-patch"
+  printf '%s\n' "$MBEDTLS_PATCH_SHA256" > "$MBEDTLS_DIR/.big-head-reality-patch"
 fi
 
 if [[ ! -f "$MSQUIC_DIR/bin/msquic.dll" || ! -f "$MSQUIC_DIR/include/msquic.h" ]]; then
@@ -117,6 +119,9 @@ cp "$WINDIVERT_DIR/WinDivert.dll" "$DIST_DIR/WinDivert.dll"
 cp "$WINDIVERT_DIR/WinDivert64.sys" "$DIST_DIR/WinDivert64.sys"
 cp "$WINDIVERT_DIR/LICENSE" "$DIST_DIR/WINDIVERT_LICENSE.txt"
 cp "$PROJECT_DIR/native/resources/MANROPE_OFL.txt" "$DIST_DIR/MANROPE_LICENSE.txt"
+cp "$PROJECT_DIR/native/vendor/pqclean/crypto_kem/ml-kem-768/clean/LICENSE" "$DIST_DIR/PQCLEAN_LICENSE.txt"
+cp "$PROJECT_DIR/native/vendor/pqclean/UPSTREAM.md" "$DIST_DIR/PQCLEAN_UPSTREAM.md"
+cp "$PROJECT_DIR/THIRD_PARTY_NOTICES.md" "$DIST_DIR/THIRD_PARTY_NOTICES.md"
 cp "$PROJECT_DIR/native/README_USER.md" "$DIST_DIR/README.md"
 
 rm -f "$DIST_ARCHIVE"

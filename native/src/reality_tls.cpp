@@ -1,4 +1,5 @@
 #include "reality_tls.h"
+#include "reality_hybrid.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -182,8 +183,10 @@ struct RealityTls::Impl {
     mbedtls_entropy_context entropy{};
     mbedtls_ctr_drbg_context random{};
     RealityTlsConfig reality;
+    RealityHybridExchange hybrid;
     std::array<unsigned char, 32> authKey{};
     bool verified{};
+    std::wstring certificateAuthError;
     bool initialized{};
     std::atomic_bool transportEof{};
     std::vector<std::string> alpnStorage;
@@ -230,8 +233,11 @@ struct RealityTls::Impl {
     }
 
     static int transformClientHello(void* context, mbedtls_svc_key_id_t privateKey,
-        const unsigned char randomBytes[32], unsigned char* body, size_t bodyLength) {
+        const unsigned char randomBytes[32], unsigned char* body, size_t* length, size_t capacity) {
         auto* self = static_cast<Impl*>(context);
+        int expanded = self->hybrid.expandClientHello(body, length, capacity);
+        if (expanded != 0) return expanded;
+        const size_t bodyLength = *length;
         if (bodyLength < 67 || body[34] != 32) return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
         std::fill_n(body + 35, 32, 0);
         std::vector<unsigned char> authenticated(4 + bodyLength);
@@ -272,13 +278,23 @@ struct RealityTls::Impl {
         return result;
     }
 
+    static int hybridKeyExchange(void* context, mbedtls_svc_key_id_t privateKey,
+        const unsigned char* share, size_t length, unsigned char secret[64]) {
+        return static_cast<Impl*>(context)->hybrid.derive(privateKey, share, length, secret);
+    }
+
     static int authenticateCertificate(void* context, const unsigned char* der, size_t length) {
         auto* self = static_cast<Impl*>(context);
+        auto fail = [self](const wchar_t* reason) {
+            self->certificateAuthError = reason;
+            return MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE;
+        };
         const unsigned char* cursor = der;
         const unsigned char* end = der + length;
         const unsigned char* certificate{};
         size_t certificateLength{};
-        if (!derElement(cursor, end, 0x30, certificate, certificateLength) || cursor != end) return -1;
+        if (!derElement(cursor, end, 0x30, certificate, certificateLength) || cursor != end)
+            return fail(L"REALITY: некорректная DER-структура сертификата сервера");
         const unsigned char* part = certificate;
         const unsigned char* certificateEnd = certificate + certificateLength;
         const unsigned char* value{};
@@ -286,22 +302,29 @@ struct RealityTls::Impl {
         if (!derElement(part, certificateEnd, 0x30, value, valueLength) ||
             !derElement(part, certificateEnd, 0x30, value, valueLength) ||
             !derElement(part, certificateEnd, 0x03, value, valueLength) ||
-            part != certificateEnd || valueLength != 65 || value[0] != 0) return -1;
+            part != certificateEnd)
+            return fail(L"REALITY: не удалось разобрать подпись сертификата сервера");
+        if (valueLength != 65 || value[0] != 0)
+            return fail(L"REALITY: сервер вернул сертификат с неподходящей подписью; возможен отказ REALITY-аутентификации. Проверьте актуальность ссылки и время Windows");
         const unsigned char* signature = value + 1;
 
         static constexpr unsigned char ed25519Oid[]{0x06, 0x03, 0x2b, 0x65, 0x70};
         const unsigned char* oid = std::search(der, end, std::begin(ed25519Oid), std::end(ed25519Oid));
-        if (oid == end) return -1;
+        if (oid == end)
+            return fail(L"REALITY: в сертификате сервера отсутствует ожидаемый ключ Ed25519");
         const unsigned char* key = oid + sizeof(ed25519Oid);
         while (key + 35 <= end && !(key[0] == 0x03 && key[1] == 0x21 && key[2] == 0x00)) ++key;
-        if (key + 35 > end) return -1;
+        if (key + 35 > end)
+            return fail(L"REALITY: не удалось извлечь ключ Ed25519 из сертификата сервера");
         key += 3;
 
         std::array<unsigned char, 64> expected{};
         const mbedtls_md_info_t* sha512 = mbedtls_md_info_from_type(MBEDTLS_MD_SHA512);
         if (!sha512 || mbedtls_md_hmac(sha512, self->authKey.data(), self->authKey.size(),
-                key, 32, expected.data()) != 0) return -1;
-        if (!constantTimeEqual(expected.data(), signature, expected.size())) return -1;
+                key, 32, expected.data()) != 0)
+            return fail(L"REALITY: локальная ошибка вычисления HMAC-SHA512 сертификата");
+        if (!constantTimeEqual(expected.data(), signature, expected.size()))
+            return fail(L"REALITY: HMAC-подпись сертификата не совпала; сервер не подтвердил REALITY-аутентификацию. Проверьте параметры ссылки; возможна несовместимость клиента");
         self->verified = true;
         return 0;
     }
@@ -387,6 +410,7 @@ bool RealityTls::connect(const RealityTlsConfig& config, std::wstring& error) {
         MBEDTLS_TLS1_3_SIG_NONE};
     mbedtls_ssl_conf_sig_algs(&self.sslConfig, signatures);
     mbedtls_ssl_conf_client_hello_transform(&self.sslConfig, Impl::transformClientHello, &self);
+    mbedtls_ssl_conf_hybrid_key_exchange(&self.sslConfig, Impl::hybridKeyExchange, &self);
     mbedtls_ssl_conf_server_certificate_auth(&self.sslConfig, Impl::authenticateCertificate, &self);
     if (!config.alpn.empty()) {
         self.alpnStorage = config.alpn;
@@ -405,7 +429,8 @@ bool RealityTls::connect(const RealityTlsConfig& config, std::wstring& error) {
     do { result = mbedtls_ssl_handshake(&self.ssl); }
     while (result == MBEDTLS_ERR_SSL_WANT_READ || result == MBEDTLS_ERR_SSL_WANT_WRITE);
     if (result != 0 || !self.verified) {
-        error = result != 0 ? mbedError(L"REALITY handshake", result) : L"REALITY: сертификат сервера не подтверждён";
+        error = !self.certificateAuthError.empty() ? self.certificateAuthError
+            : result != 0 ? mbedError(L"REALITY handshake", result) : L"REALITY: сертификат сервера не подтверждён";
         return false;
     }
     DWORD noTimeout = 0;
@@ -474,4 +499,9 @@ std::string RealityTls::negotiatedAlpn() const {
     if (!implementation_) return {};
     const char* protocol = mbedtls_ssl_get_alpn_protocol(&implementation_->ssl);
     return protocol ? protocol : "";
+}
+
+std::string RealityTls::negotiatedKeyExchange() const {
+    if (!implementation_ || !implementation_->verified) return {};
+    return implementation_->hybrid.negotiated() ? "X25519MLKEM768" : "X25519";
 }
