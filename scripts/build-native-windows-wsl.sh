@@ -7,7 +7,9 @@ TOOLCHAIN_DIR="$TOOLS_DIR/llvm-mingw"
 ARCHIVE="$TOOLS_DIR/llvm-mingw.tar.xz"
 BUILD_DIR="$PROJECT_DIR/build/native-windows"
 DIST_DIR="$PROJECT_DIR/dist/BigHeadVPN-Native"
-DIST_ARCHIVE="$PROJECT_DIR/dist/BigHeadVPN-Native.zip"
+APP_VERSION="$(tr -d '\r\n' < "$PROJECT_DIR/VERSION")"
+[[ "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Некорректный VERSION"; exit 1; }
+DIST_ARCHIVE="$PROJECT_DIR/dist/BigHeadVPN-$APP_VERSION-windows-x64-portable.zip"
 TOOLCHAIN_URL="https://github.com/mstorsjo/llvm-mingw/releases/download/20260616/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64.tar.xz"
 TOOLCHAIN_SHA256="534b92e067b22a6b4441f48ae9240a3341b17825d04d577eab0cf85c44b4deda"
 MSQUIC_VERSION="2.5.9"
@@ -113,6 +115,7 @@ cmake --build "$BUILD_DIR" --parallel
 rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
 cp "$BUILD_DIR/BigHeadVPN.exe" "$DIST_DIR/BigHeadVPN.exe"
+cp "$BUILD_DIR/BigHeadVPNStartup.exe" "$DIST_DIR/BigHeadVPNStartup.exe"
 cp "$MSQUIC_DIR/bin/msquic.dll" "$DIST_DIR/msquic.dll"
 cp "$MSQUIC_DIR/bin/LICENSE" "$DIST_DIR/MSQUIC_LICENSE.txt"
 cp "$WINDIVERT_DIR/WinDivert.dll" "$DIST_DIR/WinDivert.dll"
@@ -123,10 +126,12 @@ cp "$PROJECT_DIR/native/vendor/pqclean/crypto_kem/ml-kem-768/clean/LICENSE" "$DI
 cp "$PROJECT_DIR/native/vendor/pqclean/UPSTREAM.md" "$DIST_DIR/PQCLEAN_UPSTREAM.md"
 cp "$PROJECT_DIR/THIRD_PARTY_NOTICES.md" "$DIST_DIR/THIRD_PARTY_NOTICES.md"
 cp "$PROJECT_DIR/native/README_USER.md" "$DIST_DIR/README.md"
+cp "$PROJECT_DIR/VERSION" "$DIST_DIR/VERSION"
 
 rm -f "$DIST_ARCHIVE"
 cmake -E chdir "$PROJECT_DIR/dist" cmake -E tar cf "$DIST_ARCHIVE" \
   --format=zip BigHeadVPN-Native
+cp "$DIST_ARCHIVE" "$PROJECT_DIR/dist/BigHeadVPN-Native.zip"
 
 echo
 echo "Готово: $DIST_DIR/BigHeadVPN.exe"

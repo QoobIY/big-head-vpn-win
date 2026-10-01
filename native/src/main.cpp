@@ -4,6 +4,7 @@
 #include "socks_server.h"
 #include "process_filter.h"
 #include "autostart.h"
+#include "version.h"
 
 #include <windows.h>
 #include <windowsx.h>
@@ -72,6 +73,7 @@ struct App {
     HANDLE fontResource{};
     AppModel model;
     std::wstring activeProfileId;
+    Profile activeProfile;
     bool busy{};
     bool connecting{};
     bool disconnecting{};
@@ -192,7 +194,15 @@ void updateTrayIcon() {
     const wchar_t* tip = app.disconnecting ? L"Big Head VPN — отключение…"
         : app.connecting ? L"Big Head VPN — подключение…"
         : app.session ? L"Big Head VPN — подключено" : L"Big Head VPN — отключено";
-    wcsncpy_s(icon.szTip, tip, _TRUNCATE);
+    std::wstring tooltip = tip;
+    const std::wstring& profileId = (app.session || app.connecting || app.disconnecting)
+        ? app.activeProfileId : app.model.selectedProfileId;
+    auto profile = std::find_if(app.model.profiles.begin(), app.model.profiles.end(),
+        [&](const Profile& value) { return value.id == profileId; });
+    if ((app.session || app.connecting || app.disconnecting) && !app.activeProfile.name.empty())
+        tooltip += L"\n" + app.activeProfile.name;
+    else if (profile != app.model.profiles.end()) tooltip += L"\nВыбран: " + profile->name;
+    wcsncpy_s(icon.szTip, tooltip.c_str(), _TRUNCATE);
     if (!app.trayAdded) {
         app.trayAdded = Shell_NotifyIconW(NIM_ADD, &icon) != FALSE;
         if (app.trayAdded) {
@@ -205,18 +215,114 @@ void updateTrayIcon() {
     if (previousIcon) DestroyIcon(previousIcon);
 }
 
+const Profile* trayProfile() {
+    if (app.session || app.connecting || app.disconnecting) return &app.activeProfile;
+    auto selected = std::find_if(app.model.profiles.begin(), app.model.profiles.end(),
+        [](const Profile& profile) { return profile.id == app.model.selectedProfileId; });
+    return selected == app.model.profiles.end() ? nullptr : &*selected;
+}
+
+std::wstring trayStatus() {
+    return app.disconnecting ? L"Отключение…" : app.connecting ? L"Подключение…"
+        : app.session ? L"VPN подключён" : L"VPN отключён";
+}
+
+struct TrayMenuRow {
+    std::wstring title;
+    std::wstring detail;
+    COLORREF color = TEXT;
+    bool divider{};
+    bool status{};
+};
+
+int trayPixels(int pixels) {
+    return MulDiv(pixels, GetDpiForWindow(app.window), 96);
+}
+
+void drawTrayMenuRow(const DRAWITEMSTRUCT& item) {
+    const auto* row = reinterpret_cast<const TrayMenuRow*>(item.itemData);
+    if (!row) return;
+    int saved = SaveDC(item.hDC);
+    const bool selected = (item.itemState & ODS_SELECTED) && !(item.itemState & ODS_DISABLED);
+    SetDCBrushColor(item.hDC, selected ? RGB(43, 48, 72) : CARD);
+    FillRect(item.hDC, &item.rcItem, reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+    RECT text = item.rcItem;
+    text.left += trayPixels(18); text.right -= trayPixels(18);
+    if (row->divider) {
+        text.top += trayPixels(5); text.bottom = text.top + 1;
+        SetDCBrushColor(item.hDC, BORDER);
+        FillRect(item.hDC, &text, reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+    } else {
+        SetBkMode(item.hDC, TRANSPARENT);
+        SetTextColor(item.hDC, row->color);
+        SelectObject(item.hDC, row->detail.empty() ? app.regular : app.medium);
+        if (row->status) {
+            SetDCBrushColor(item.hDC, row->color);
+            SelectObject(item.hDC, GetStockObject(DC_BRUSH));
+            SelectObject(item.hDC, GetStockObject(NULL_PEN));
+            int y = text.top + trayPixels(19);
+            Ellipse(item.hDC, text.left, y - trayPixels(4), text.left + trayPixels(8), y + trayPixels(4));
+            text.left += trayPixels(18);
+        }
+        if (row->detail.empty()) {
+            if (item.itemState & ODS_DISABLED) SetTextColor(item.hDC, MUTED);
+            DrawTextW(item.hDC, row->title.c_str(), -1, &text,
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        } else {
+            text.top += trayPixels(8);
+            RECT title = text; title.bottom = title.top + trayPixels(22);
+            DrawTextW(item.hDC, row->title.c_str(), -1, &title, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            text.top += trayPixels(24);
+            SelectObject(item.hDC, app.regular); SetTextColor(item.hDC, MUTED);
+            DrawTextW(item.hDC, row->detail.c_str(), -1, &text, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+    }
+    RestoreDC(item.hDC, saved);
+}
+
 void showTrayMenu(POINT point) {
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
-    AppendMenuW(menu, MF_STRING | MF_DEFAULT, ID_TRAY_OPEN, L"Открыть Big Head VPN");
-    AppendMenuW(menu, MF_STRING | (app.disconnecting ? MF_GRAYED : 0), ID_TRAY_TOGGLE,
-        app.disconnecting ? L"Отключение VPN…" : app.session ? L"Отключить VPN" : L"Подключить VPN");
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, L"Выход");
+    const Profile* profile = trayProfile();
+    const bool transitioning = app.connecting || app.disconnecting;
+    const COLORREF statusColor = transitioning ? RGB(245, 158, 11)
+        : app.session ? RGB(34, 197, 94) : MUTED;
+    std::wstring mode = app.session
+        ? app.processFilter ? L"Выбранные приложения через VPN" : L"Только локальный прокси"
+        : L"Трафик через VPN не направляется";
+    std::wstring proxy = app.session
+        ? app.model.listenAddress + L":" + std::to_wstring(app.model.listenPort) +
+            (app.session->supportsUdp() ? L" · TCP + UDP" : L" · TCP")
+        : L"Подключитесь, чтобы запустить прокси";
+    // Keep itemData stable for the duration of the native menu loop.
+    TrayMenuRow rows[] = {
+        {L"Big Head VPN", L"Версия " BIG_HEAD_VERSION_W},
+        {trayStatus(), transitioning ? L"Пожалуйста, подождите" : mode, statusColor, false, true},
+        {app.session || transitioning ? L"Текущее подключение" : L"Выбранный сервер",
+            profile ? profile->name : L"Нет выбранного сервера"},
+        {L"Протокол", profile ? profileKindName(profileKind(profile->uri)) : L"—"},
+        {L"SOCKS5 / HTTP CONNECT", proxy},
+        {L"", L"", TEXT, true},
+        {L"Открыть Big Head VPN", L""},
+        {transitioning ? L"Дождитесь завершения…" : app.session ? L"Отключить VPN" : L"Подключить VPN", L"", ACCENT},
+        {L"", L"", TEXT, true},
+        {L"Выход", L"", ERROR_RED}
+    };
+    for (UINT index = 0; index < std::size(rows); ++index) {
+        UINT command = index == 6 ? ID_TRAY_OPEN : index == 7 ? ID_TRAY_TOGGLE : index == 9 ? ID_TRAY_EXIT : 300 + index;
+        UINT flags = MF_OWNERDRAW;
+        if (index < 6 || index == 8 || (index == 7 && (transitioning || (!app.session && !profile)))) flags |= MF_GRAYED;
+        AppendMenuW(menu, flags, command, reinterpret_cast<LPCWSTR>(&rows[index]));
+    }
+    SetMenuDefaultItem(menu, ID_TRAY_OPEN, FALSE);
+    MENUINFO info{}; info.cbSize = sizeof(info); info.fMask = MIM_BACKGROUND;
+    info.hbrBack = app.card; SetMenuInfo(menu, &info);
+    if (point.x == -1 && point.y == -1) GetCursorPos(&point);
     SetForegroundWindow(app.window);
     UINT command = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
         point.x, point.y, 0, app.window, nullptr);
     DestroyMenu(menu);
+    PostMessageW(app.window, WM_NULL, 0, 0);
     if (command) PostMessageW(app.window, WM_COMMAND, MAKEWPARAM(command, 0), 0);
 }
 
@@ -363,6 +469,7 @@ void beginConnect(const std::wstring& profileId) {
         return;
     }
     app.activeProfileId = selected->id;
+    app.activeProfile = *selected;
     const ProfileKind kind = profileKind(selected->uri);
     app.connecting = true;
     EnableWindow(app.connect, FALSE);
@@ -619,7 +726,7 @@ void paint(HDC dc, const RECT& client) {
     if (icon) { DrawIconEx(dc, 24, 18, icon, 38, 38, 0, nullptr, DI_NORMAL); DestroyIcon(icon); }
     TextOutW(dc, 72, 19, L"Big Head VPN", 12);
     SelectObject(dc, app.regular); SetTextColor(dc, MUTED);
-    constexpr wchar_t subtitle[] = L"Лёгкий нативный клиент для Windows";
+    constexpr wchar_t subtitle[] = L"Версия " BIG_HEAD_VERSION_W L" · Лёгкий клиент для Windows";
     TextOutW(dc, 73, 48, subtitle, static_cast<int>(std::size(subtitle) - 1));
     label(dc, margin + 20, 247, L"СЕРВЕРЫ И ПОДПИСКИ");
     label(dc, rightX + 20, 143, L"ЛОКАЛЬНЫЙ PROXY: SOCKS5 + HTTP");
@@ -763,12 +870,19 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         app.log = control(L"EDIT", L"", ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL, ID_LOG);
         button(L"Копировать", ID_COPY_LOG);
         button(L"Очистить", ID_CLEAR_LOG);
-        refillGroups(); refillSelectedProcesses(); refreshRunningProcesses(); updateFilterStatus(); appendLog(L"Нативное приложение запущено");
+        refillGroups(); refillSelectedProcesses(); refreshRunningProcesses(); updateFilterStatus(); appendLog(L"Big Head VPN " BIG_HEAD_VERSION_W L" запущен");
         if (!autostartError.empty()) appendLog(L"Автозагрузка: " + autostartError);
         SetTimer(hwnd, FILTER_STATUS_TIMER, 1500, nullptr);
         showBanner(L"Hysteria2 и VLESS XHTTP готовы; выберите сервер и подключитесь");
         return 0;
     }
+    case WM_ACTIVATE:
+        if (LOWORD(wParam) != WA_INACTIVE && app.autostart) {
+            std::wstring error;
+            app.autostartEnabled = isAutostartEnabled(error);
+            updateAutostartButton();
+        }
+        return 0;
     case WM_SIZE: layout(LOWORD(lParam), HIWORD(lParam)); return 0;
     case WM_TIMER:
         if (wParam == FILTER_STATUS_TIMER) updateFilterStatus(true);
@@ -808,14 +922,19 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     }
     case WM_MEASUREITEM: {
         auto* measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
-        if (measure->CtlID == ID_PROFILES) measure->itemHeight = 68;
+        if (measure->CtlType == ODT_MENU) {
+            const auto* row = reinterpret_cast<const TrayMenuRow*>(measure->itemData);
+            measure->itemWidth = trayPixels(340);
+            measure->itemHeight = trayPixels(row && row->divider ? 11 : row && !row->detail.empty() ? 58 : 40);
+        } else if (measure->CtlID == ID_PROFILES) measure->itemHeight = 68;
         else if (measure->CtlID == ID_RUNNING_PROCESSES || measure->CtlID == ID_SELECTED_PROCESSES) measure->itemHeight = 30;
         else if (measure->CtlID == ID_GROUPS) measure->itemHeight = 36;
         return TRUE;
     }
     case WM_DRAWITEM: {
         const auto& item = *reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
-        if (item.hwndItem == app.banner) drawBanner(item);
+        if (item.CtlType == ODT_MENU) drawTrayMenuRow(item);
+        else if (item.hwndItem == app.banner) drawBanner(item);
         else if (item.CtlType == ODT_LISTBOX || item.CtlType == ODT_COMBOBOX) drawChoice(item);
         else drawButton(item);
         return TRUE;
@@ -904,6 +1023,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         } else if (id == ID_GROUPS && notification == CBN_SELCHANGE) {
             refillProfiles();
         } else if (id == ID_CONNECT) {
+            if (app.connecting || app.disconnecting) return 0;
             saveListenerFields();
             if (app.session) {
                 beginDisconnect();
@@ -953,6 +1073,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             app.socks = SocksServer::start(app.model.listenAddress, app.model.listenPort, *app.session, listenerError);
             if (!app.socks) {
                 app.session.reset();
+                updateTrayIcon();
                 SetWindowTextW(app.connect, L"Подключить");
                 showBanner(listenerError, true); appendLog(L"Ошибка SOCKS5: " + listenerError);
                 return 0;
@@ -963,6 +1084,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 app.processFilter = ProcessFilter::start(app.model.filteredProcesses, *app.session, listenerError);
                 if (!app.processFilter) {
                     app.socks.reset(); app.session.reset();
+                    updateTrayIcon();
                     SetWindowTextW(app.connect, L"Подключить");
                     showBanner(listenerError, true); appendLog(L"Ошибка фильтра процессов: " + listenerError);
                     return 0;
@@ -1046,6 +1168,24 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 }
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int show) {
+    if (commandLine && wcscmp(commandLine, L"--remove-autostart") == 0) {
+        std::wstring error;
+        if (removeOwnedAutostart(error)) return 0;
+        OutputDebugStringW(error.c_str());
+        return 1;
+    }
+    // Also lets Setup/Uninstall detect a running client before replacing files.
+    HANDLE instanceMutex = CreateMutexW(nullptr, FALSE, L"Local\\BigHeadVPNNative");
+    if (!instanceMutex) return 3;
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND existing = FindWindowW(L"BigHeadVPNNativeWindow", nullptr);
+        if (existing && !(commandLine && wcsstr(commandLine, L"--autostart"))) {
+            ShowWindow(existing, SW_RESTORE);
+            SetForegroundWindow(existing);
+        }
+        CloseHandle(instanceMutex);
+        return 0;
+    }
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES}; InitCommonControlsEx(&controls);
     WNDCLASSEXW cls{};
@@ -1056,7 +1196,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int show) 
     if (!RegisterClassExW(&cls)) return 1;
     taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
     BOOL dark = TRUE;
-    HWND window = CreateWindowExW(0, cls.lpszClassName, L"Big Head VPN", WS_OVERLAPPEDWINDOW,
+    HWND window = CreateWindowExW(0, cls.lpszClassName, L"Big Head VPN " BIG_HEAD_VERSION_W, WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 1180, 760, nullptr, nullptr, instance, nullptr);
     if (!window) return 2;
     DwmSetWindowAttribute(window, 20, &dark, sizeof(dark));

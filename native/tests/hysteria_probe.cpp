@@ -198,6 +198,14 @@ int wmain(int argc, wchar_t** argv) {
         std::cout << '\n';
         return 0;
     }
+    if (argc == 3 && std::wstring_view(argv[1]) == L"--startup-shortcut-fixture") {
+        std::wstring error;
+        if (!createStartupShortcutForTest(argv[2], error)) {
+            std::cerr << utf8(error) << std::endl;
+            return 1;
+        }
+        return 0;
+    }
     if (argc == 3 && std::wstring_view(argv[1]) == L"--autostart-cycle") {
         std::wstring error;
         bool before = isAutostartEnabled(error);

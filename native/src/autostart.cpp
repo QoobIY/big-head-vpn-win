@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <taskschd.h>
 #include <oleauto.h>
+#include <shlobj.h>
 
 #include <utility>
 
@@ -69,6 +70,50 @@ std::wstring executablePath() {
     result.resize(size);
     return result;
 }
+
+std::wstring startupShortcut(std::wstring& error) {
+    PWSTR folder{};
+    HRESULT result = SHGetKnownFolderPath(FOLDERID_Startup, KF_FLAG_CREATE, nullptr, &folder);
+    if (FAILED(result)) { error = L"Не удалось открыть папку автозагрузки: " + systemMessage(result); return {}; }
+    std::wstring path = std::wstring(folder) + L"\\Big Head VPN.lnk";
+    CoTaskMemFree(folder);
+    return path;
+}
+
+bool createStartupShortcut(const std::wstring& shortcut, const std::wstring& executable, std::wstring& error) {
+    // Explorer starts an unelevated GUI launcher without a console window.
+    // The demand-only task supplies the rights required by WinDivert.
+    std::wstring launcher = executable.substr(0, executable.find_last_of(L"\\/") + 1) + L"BigHeadVPNStartup.exe";
+    if (GetFileAttributesW(launcher.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        error = L"Не найден BigHeadVPNStartup.exe рядом с приложением"; return false;
+    }
+    ComObject<IShellLinkW> link;
+    HRESULT result = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW,
+        reinterpret_cast<void**>(link.put()));
+    if (SUCCEEDED(result)) result = link->SetPath(launcher.c_str());
+    if (SUCCEEDED(result)) result = link->SetArguments(L"");
+    if (SUCCEEDED(result)) result = link->SetDescription(L"Запуск Big Head VPN при входе в Windows");
+    if (SUCCEEDED(result)) result = link->SetIconLocation(executable.c_str(), 0);
+    if (SUCCEEDED(result)) result = link->SetShowCmd(SW_SHOWNORMAL);
+    ComObject<IPersistFile> file;
+    if (SUCCEEDED(result)) result = link->QueryInterface(IID_IPersistFile, reinterpret_cast<void**>(file.put()));
+    if (SUCCEEDED(result)) result = file->Save(shortcut.c_str(), TRUE);
+    if (FAILED(result)) { error = L"Не удалось создать ярлык автозагрузки: " + systemMessage(result); return false; }
+    return true;
+}
+
+bool startupDisabledByWindows() {
+    // Windows stores Task Manager's per-entry switch separately from the link.
+    // Treat unknown/missing formats as enabled; never rewrite the binary format.
+    BYTE state[12]{};
+    DWORD size = sizeof(state);
+    DWORD type{};
+    LSTATUS result = RegGetValueW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\StartupFolder",
+        L"Big Head VPN.lnk", RRF_RT_REG_BINARY, &type, state, &size);
+    return result == ERROR_SUCCESS && size == sizeof(state) && (state[0] == 3 || state[0] == 7);
+}
+
 }
 
 bool isAutostartEnabled(std::wstring& error) {
@@ -85,7 +130,21 @@ bool isAutostartEnabled(std::wstring& error) {
     VARIANT_BOOL enabled = VARIANT_FALSE;
     result = task->get_Enabled(&enabled);
     if (FAILED(result)) { error = L"Не удалось прочитать состояние автозагрузки: " + systemMessage(result); return false; }
-    return enabled == VARIANT_TRUE;
+    if (enabled != VARIANT_TRUE) return false;
+    auto shortcut = startupShortcut(error);
+    if (shortcut.empty()) return false;
+    if (GetFileAttributesW(shortcut.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        // Upgrade the old logon-trigger task to visible Explorer startup once.
+        ComObject<ITaskDefinition> definition;
+        ComObject<ITriggerCollection> triggers;
+        LONG count{};
+        if (SUCCEEDED(task->get_Definition(definition.put())) &&
+            SUCCEEDED(definition->get_Triggers(triggers.put())) &&
+            SUCCEEDED(triggers->get_Count(&count)) && count > 0)
+            return setAutostartEnabled(true, error);
+        return false;
+    }
+    return !startupDisabledByWindows();
 }
 
 bool setAutostartEnabled(bool enabled, std::wstring& error) {
@@ -95,7 +154,13 @@ bool setAutostartEnabled(bool enabled, std::wstring& error) {
     ComObject<ITaskService> service; ComObject<ITaskFolder> root;
     if (!openScheduler(service, root, error)) return false;
     BString name(TASK_NAME);
+    auto shortcut = startupShortcut(error);
+    if (shortcut.empty()) return false;
     if (!enabled) {
+        if (!DeleteFileW(shortcut.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) {
+            error = L"Не удалось удалить ярлык автозагрузки: " + systemMessage(HRESULT_FROM_WIN32(GetLastError()));
+            return false;
+        }
         HRESULT result = root->DeleteTask(name, 0);
         if (result == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) return true;
         if (FAILED(result)) { error = L"Не удалось отключить автозагрузку: " + systemMessage(result); return false; }
@@ -120,15 +185,15 @@ bool setAutostartEnabled(bool enabled, std::wstring& error) {
         error = L"Не удалось настроить права задания автозагрузки"; return false;
     }
     ComObject<ITaskSettings> settings;
-    if (SUCCEEDED(task->get_Settings(settings.put()))) {
-        settings->put_StartWhenAvailable(VARIANT_TRUE);
-        settings->put_DisallowStartIfOnBatteries(VARIANT_FALSE);
-        settings->put_StopIfGoingOnBatteries(VARIANT_FALSE);
-    }
-    ComObject<ITriggerCollection> triggers;
-    ComObject<ITrigger> trigger;
-    if (FAILED(task->get_Triggers(triggers.put())) || FAILED(triggers->Create(TASK_TRIGGER_LOGON, trigger.put()))) {
-        error = L"Не удалось создать триггер входа в Windows"; return false;
+    BString unlimited(L"PT0S");
+    if (FAILED(task->get_Settings(settings.put())) ||
+        FAILED(settings->put_Enabled(VARIANT_TRUE)) ||
+        FAILED(settings->put_AllowDemandStart(VARIANT_TRUE)) ||
+        FAILED(settings->put_MultipleInstances(TASK_INSTANCES_IGNORE_NEW)) ||
+        FAILED(settings->put_ExecutionTimeLimit(unlimited)) ||
+        FAILED(settings->put_DisallowStartIfOnBatteries(VARIANT_FALSE)) ||
+        FAILED(settings->put_StopIfGoingOnBatteries(VARIANT_FALSE))) {
+        error = L"Не удалось настроить задание автозагрузки"; return false;
     }
     ComObject<IActionCollection> actions;
     ComObject<IAction> action;
@@ -139,7 +204,8 @@ bool setAutostartEnabled(bool enabled, std::wstring& error) {
     result = action->QueryInterface(IID_IExecAction, reinterpret_cast<void**>(execute.put()));
     if (FAILED(result)) { error = L"Не удалось настроить запуск приложения"; return false; }
     BString executable(path), arguments(L"--autostart");
-    if (FAILED(execute->put_Path(executable)) || FAILED(execute->put_Arguments(arguments))) {
+    BString directory(path.substr(0, path.find_last_of(L"\\/")));
+    if (FAILED(execute->put_Path(executable)) || FAILED(execute->put_Arguments(arguments)) || FAILED(execute->put_WorkingDirectory(directory))) {
         error = L"Не удалось записать путь приложения в автозагрузку"; return false;
     }
     VARIANT empty; VariantInit(&empty);
@@ -147,5 +213,69 @@ bool setAutostartEnabled(bool enabled, std::wstring& error) {
     result = root->RegisterTaskDefinition(name, task.get(), TASK_CREATE_OR_UPDATE, empty, empty,
         TASK_LOGON_INTERACTIVE_TOKEN, empty, registered.put());
     if (FAILED(result)) { error = L"Не удалось включить автозагрузку: " + systemMessage(result); return false; }
+    if (!createStartupShortcut(shortcut, path, error)) return false;
+    HKEY approval{};
+    LSTATUS approvalResult = RegOpenKeyExW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\StartupFolder",
+        0, KEY_SET_VALUE, &approval);
+    if (approvalResult == ERROR_SUCCESS) {
+        approvalResult = RegDeleteValueW(approval, L"Big Head VPN.lnk");
+        RegCloseKey(approval);
+    }
+    if (approvalResult != ERROR_SUCCESS && approvalResult != ERROR_FILE_NOT_FOUND) {
+        error = L"Не удалось включить автозагрузку в Windows: " + systemMessage(HRESULT_FROM_WIN32(approvalResult));
+        return false;
+    }
     return true;
+}
+
+#ifdef BIG_HEAD_VPN_TESTING
+bool createStartupShortcutForTest(const std::wstring& shortcut, std::wstring& error) {
+    ComSession session;
+    if (!session.ready()) { error = L"COM initialization failed"; return false; }
+    return createStartupShortcut(shortcut, executablePath(), error);
+}
+#endif
+
+bool runAutostartTask(std::wstring& error) {
+    ComSession session;
+    if (!session.ready()) { error = L"Не удалось инициализировать Windows COM"; return false; }
+    ComObject<ITaskService> service;
+    ComObject<ITaskFolder> root;
+    if (!openScheduler(service, root, error)) return false;
+    BString name(TASK_NAME);
+    ComObject<IRegisteredTask> task;
+    HRESULT result = root->GetTask(name, task.put());
+    VARIANT empty; VariantInit(&empty);
+    ComObject<IRunningTask> running;
+    if (SUCCEEDED(result)) result = task->Run(empty, running.put());
+    if (FAILED(result)) { error = systemMessage(result); return false; }
+    return true;
+}
+
+bool removeOwnedAutostart(std::wstring& error) {
+    ComSession session;
+    if (!session.ready()) { error = L"Не удалось инициализировать Windows COM"; return false; }
+    ComObject<ITaskService> service;
+    ComObject<ITaskFolder> root;
+    if (!openScheduler(service, root, error)) return false;
+    BString name(TASK_NAME);
+    ComObject<IRegisteredTask> task;
+    HRESULT result = root->GetTask(name, task.put());
+    if (result == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) return true;
+    ComObject<ITaskDefinition> definition;
+    ComObject<IActionCollection> actions;
+    ComObject<IAction> action;
+    ComObject<IExecAction> execute;
+    if (SUCCEEDED(result)) result = task->get_Definition(definition.put());
+    if (SUCCEEDED(result)) result = definition->get_Actions(actions.put());
+    if (SUCCEEDED(result)) result = actions->get_Item(1, action.put());
+    if (SUCCEEDED(result)) result = action->QueryInterface(IID_IExecAction, reinterpret_cast<void**>(execute.put()));
+    BSTR target{};
+    if (SUCCEEDED(result)) result = execute->get_Path(&target);
+    if (FAILED(result)) { error = L"Не удалось проверить задание автозагрузки: " + systemMessage(result); return false; }
+    // A portable copy may own the shared task. Uninstall only this installation.
+    const bool owned = target && _wcsicmp(target, executablePath().c_str()) == 0;
+    SysFreeString(target);
+    return !owned || setAutostartEnabled(false, error);
 }

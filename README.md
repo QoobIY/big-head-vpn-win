@@ -7,8 +7,9 @@
 WinHTTP-загрузка, защищённое DPAPI-хранилище и компактное MsQuic-ядро.
 Интерфейс использует встроенный Manrope из Google Fonts: шрифт работает
 офлайн и не требует установки в Windows.
-Переключатель автозагрузки в шапке создаёт задание входа в Планировщике
-Windows с повышенными правами, поэтому VPN запускается без повторного UAC.
+Переключатель автозагрузки в шапке добавляет видимый в Windows ярлык
+автозагрузки. Оконный запускатель без интерфейса вызывает задачу Планировщика
+с повышенными правами, поэтому VPN запускается в трее без повторного UAC.
 QUIC/TLS, HTTP/3/QPACK, авторизация Hysteria2 и TCP CONNECT через локальный
 SOCKS5 relay проверены на официальном сервере и реальной подписке. Также готов
 VLESS TCP/raw через REALITY с `xtls-rprx-vision`: реализация проверяется
@@ -36,6 +37,65 @@ IPv4/IPv6, а UDP передаётся через нативные Hysteria2 QUI
 ```text
 dist/BigHeadVPN-Native/BigHeadVPN.exe
 dist/BigHeadVPN-Native/msquic.dll
+```
+
+## Версии и установщик Windows
+
+Текущая версия: **0.1.0**. Единственный источник версии — файл `VERSION`
+в корне проекта в формате `major.minor.patch`. CMake подставляет её в
+интерфейс, VERSIONINFO обоих EXE и манифесты; сборка установщика использует
+то же значение. Не меняйте версию вручную в шаблонах ресурсов.
+
+Для следующего релиза измените `VERSION`: исправления — `0.1.1`, новые
+возможности — `0.2.0`, несовместимые изменения — новая основная версия.
+Соберите приложение и установщик:
+
+```bash
+bash scripts/build-windows-installer-wsl.sh
+```
+
+Для установщика нужен Windows-компилятор Inno Setup. Скрипт ищет
+`.build-tools/inno-setup/app/ISCC.exe` и стандартные каталоги установки
+Inno Setup 6. Можно передать путь:
+
+```bash
+bash scripts/build-windows-installer-wsl.sh -CompilerPath 'C:\Tools\Inno Setup 6\ISCC.exe'
+```
+
+При сборке непосредственно из Windows, после нативной сборки:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-installer.ps1
+```
+
+Проверенный компилятор этой сборки — Inno Setup 6.2.2 из официального релиза:
+`https://github.com/jrsoftware/issrc/releases/download/is-6_2_2/innosetup-6.2.2.exe`.
+SHA-256: `8117d10d00a2ad33a1390978ea3872861c330e087914410a6377b22c4c5b8563`.
+Компилятор используется только при сборке. В WSL его и входные файлы временно
+копируют на локальный диск Windows для корректного чтения VERSIONINFO;
+временная папка удаляется после компиляции.
+
+Артефакты релиза:
+
+- `dist/BigHeadVPN-0.1.0-windows-x64-setup.exe` — установщик;
+- `dist/BigHeadVPN-0.1.0-windows-x64-setup.exe.sha256` — контрольная сумма;
+- `dist/BigHeadVPN-0.1.0-windows-x64-portable.zip` — переносимая версия;
+- `dist/BigHeadVPN-Native.zip` — копия переносимого архива по прежнему пути.
+
+Установщик добавляет меню «Пуск», необязательный ярлык на рабочем столе и
+запись в списке установленных приложений. Постоянный `AppId` обеспечивает
+обновление той же установки. Перед обновлением или удалением завершите
+приложение через меню трея: установщик проверяет работающий экземпляр.
+Установка более старой версии поверх новой блокируется. Автозагрузка
+управляется кнопкой приложения; установщик не включает её самостоятельно.
+При удалении убирается принадлежащая этой установке автозагрузка;
+подписки и настройки в `%LOCALAPPDATA%\BigHeadVPNNative` сохраняются.
+
+Проверки на Windows (без изменения системной установки):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-version.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-autostart-shortcut.ps1
 ```
 
 LLVM-MinGW используется только при сборке и в приложение не попадает. MsQuic —

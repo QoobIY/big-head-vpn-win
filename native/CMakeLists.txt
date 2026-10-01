@@ -1,5 +1,20 @@
 cmake_minimum_required(VERSION 3.24)
-project(BigHeadVPNNative LANGUAGES C CXX RC)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../VERSION" BIG_HEAD_VERSION)
+string(STRIP "${BIG_HEAD_VERSION}" BIG_HEAD_VERSION)
+if(NOT BIG_HEAD_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+    message(FATAL_ERROR "VERSION must contain major.minor.patch, for example 0.1.0")
+endif()
+project(BigHeadVPNNative VERSION "${BIG_HEAD_VERSION}" LANGUAGES C CXX RC)
+foreach(component PROJECT_VERSION_MAJOR PROJECT_VERSION_MINOR PROJECT_VERSION_PATCH)
+    if(${component} GREATER 65535)
+        message(FATAL_ERROR "Windows version components must be <= 65535")
+    endif()
+endforeach()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../VERSION")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+foreach(resource version.h version-resource.rc app.manifest startup.manifest app.rc startup.rc)
+    configure_file("resources/${resource}.in" "generated/${resource}" @ONLY)
+endforeach()
 
 set(LSQPACK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.build-tools/ls-qpack")
 set(NGHTTP2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.build-tools/nghttp2")
@@ -53,12 +68,17 @@ add_executable(BigHeadVPN WIN32
     src/socks_server.cpp
     src/process_filter.cpp
     src/autostart.cpp
-    resources/app.rc
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/app.rc"
 )
 
 # Recompile Windows resources when the shared application icon changes.
-set_property(SOURCE resources/app.rc APPEND PROPERTY OBJECT_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/big-head-vpn.ico")
+set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/app.rc" APPEND PROPERTY OBJECT_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/big-head-vpn.ico"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/Manrope-Variable.ttf"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/version-resource.rc"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/app.manifest")
+
+target_include_directories(BigHeadVPN PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
 target_include_directories(BigHeadVPN SYSTEM PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../.build-tools/msquic/include"
@@ -108,7 +128,7 @@ target_include_directories(BigHeadVPNProbe SYSTEM PRIVATE
 )
 target_include_directories(BigHeadVPNProbe PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_options(BigHeadVPNProbe PRIVATE -municode -static -static-libgcc -static-libstdc++ -Wl,--gc-sections -Wl,--strip-all)
-target_link_libraries(BigHeadVPNProbe PRIVATE mlkem768 lsqpack nghttp2_static mbedtls mbedx509 mbedcrypto advapi32 bcrypt iphlpapi oleaut32 secur32 taskschd winhttp ws2_32)
+target_link_libraries(BigHeadVPNProbe PRIVATE mlkem768 lsqpack nghttp2_static mbedtls mbedx509 mbedcrypto advapi32 bcrypt iphlpapi oleaut32 secur32 shell32 taskschd winhttp ws2_32)
 
 add_executable(BigHeadVPNHybridTest EXCLUDE_FROM_ALL
     tests/reality_hybrid_test.cpp src/reality_hybrid.cpp)
@@ -117,3 +137,16 @@ target_compile_features(BigHeadVPNHybridTest PRIVATE cxx_std_20)
 target_compile_options(BigHeadVPNHybridTest PRIVATE -Wall -Wextra -Wpedantic)
 target_link_options(BigHeadVPNHybridTest PRIVATE -static -static-libgcc -static-libstdc++)
 target_link_libraries(BigHeadVPNHybridTest PRIVATE mlkem768 mbedcrypto bcrypt advapi32)
+
+# Unelevated, windowless entry for Explorer's Startup list. The task launches
+# the main requireAdministrator executable after startup is enabled by the user.
+add_executable(BigHeadVPNStartup WIN32 src/startup_main.cpp src/autostart.cpp "${CMAKE_CURRENT_BINARY_DIR}/generated/startup.rc")
+target_compile_features(BigHeadVPNStartup PRIVATE cxx_std_20)
+target_compile_definitions(BigHeadVPNStartup PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+target_compile_options(BigHeadVPNStartup PRIVATE -Os -Wall -Wextra -Wpedantic)
+target_link_options(BigHeadVPNStartup PRIVATE -municode -static -static-libgcc -static-libstdc++ -Wl,--gc-sections -Wl,--strip-all)
+target_link_libraries(BigHeadVPNStartup PRIVATE advapi32 oleaut32 shell32 taskschd)
+set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/startup.rc" APPEND PROPERTY OBJECT_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/big-head-vpn.ico"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/version-resource.rc"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/startup.manifest")

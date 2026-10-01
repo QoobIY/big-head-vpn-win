@@ -1,0 +1,3 @@
+#pragma once
+#define BIG_HEAD_VERSION "@PROJECT_VERSION@"
+#define BIG_HEAD_VERSION_W L"@PROJECT_VERSION@"
