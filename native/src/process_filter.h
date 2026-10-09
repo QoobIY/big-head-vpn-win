@@ -13,6 +13,9 @@ public:
         TunnelClient& client,
         std::wstring& error);
 
+    // Interrupt traffic without waiting for worker threads to finish.
+    void requestStop();
+
     ~ProcessFilter();
     ProcessFilter(const ProcessFilter&) = delete;
     ProcessFilter& operator=(const ProcessFilter&) = delete;

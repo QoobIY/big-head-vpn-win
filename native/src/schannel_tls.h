@@ -9,6 +9,7 @@
 #include <schannel.h>
 #include <security.h>
 
+#include <atomic>
 #include <mutex>
 #include <span>
 #include <string>
@@ -31,7 +32,7 @@ private:
     bool receiveEncrypted(std::wstring& error);
     bool sendRaw(const void* data, size_t size, std::wstring& error);
 
-    SOCKET socket_{INVALID_SOCKET};
+    std::atomic<SOCKET> socket_{INVALID_SOCKET};
     CredHandle credentials_{};
     CtxtHandle context_{};
     bool haveCredentials_{};

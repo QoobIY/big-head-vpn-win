@@ -13,6 +13,9 @@ public:
         TunnelClient& client,
         std::wstring& error);
 
+    // Interrupt traffic without waiting for worker threads to finish.
+    void requestStop();
+
     ~SocksServer();
     SocksServer(const SocksServer&) = delete;
     SocksServer& operator=(const SocksServer&) = delete;

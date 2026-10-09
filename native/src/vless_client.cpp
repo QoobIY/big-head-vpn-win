@@ -405,6 +405,8 @@ public:
 
     void stop() {
         if (stopping_.exchange(true)) return;
+        // A sender can hold mutex_ while blocked in TLS I/O.
+        tls_.shutdownTransport();
         {
             std::lock_guard lock(mutex_);
             if (!failed_) {

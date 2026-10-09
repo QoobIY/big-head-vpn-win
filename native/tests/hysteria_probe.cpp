@@ -44,6 +44,101 @@ std::string utf8(const std::wstring& value) {
 }
 
 int wmain(int argc, wchar_t** argv) {
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--tls-stop-test") {
+        WSADATA data{};
+        if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return 1;
+        SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in address{}; address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) ||
+                listen(listener, 1)) return 1;
+        int length = sizeof(address);
+        if (getsockname(listener, reinterpret_cast<sockaddr*>(&address), &length)) return 1;
+        SchannelTls tls;
+        std::thread worker([&] {
+            std::wstring error;
+            tls.connect(L"127.0.0.1", ntohs(address.sin_port), error);
+        });
+        SOCKET peer = accept(listener, nullptr, nullptr);
+        if (peer == INVALID_SOCKET) return 1;
+        // The peer accepts ClientHello and never returns any TLS response.
+        char hello[8192];
+        if (recv(peer, hello, sizeof(hello), 0) <= 0) return 1;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        auto before = std::chrono::steady_clock::now();
+        tls.shutdownTransport();
+        tls.shutdownTransport();
+        worker.join();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - before).count();
+        closesocket(peer); closesocket(listener);
+        tls.close();
+        WSACleanup();
+        std::cout << "tls_stop_ms=" << elapsed << std::endl;
+        return elapsed <= 500 ? 0 : 1;
+    }
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--local-stop-test") {
+        class IdleTunnel final : public TunnelClient {
+        public:
+            void stop() override {}
+            bool relayTcp(const std::string&, std::uintptr_t socket,
+                    std::wstring&, bool) override {
+                char data[256];
+                while (recv(static_cast<SOCKET>(socket), data, sizeof(data), 0) > 0) {}
+                return true;
+            }
+            bool sendUdp(uint32_t, const std::string&, const unsigned char*,
+                size_t, std::wstring&) override { return true; }
+            void setErrorHandler(ErrorHandler) override {}
+            std::wstring udpDiagnostics() const override { return {}; }
+            bool supportsUdp() const override { return true; }
+        protected:
+            void installUdpReceiveHandler(UdpReceiveHandler) override {}
+        } tunnel;
+        WSADATA data{};
+        if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return 1;
+        // Leave clients blocked in SOCKS greeting, HTTP headers, TCP relay,
+        // and UDP association. None cooperates with the server's shutdown.
+        for (int iteration = 0; iteration < 10; ++iteration) {
+            std::wstring error;
+            auto server = SocksServer::start(L"127.0.0.1", 29879, tunnel, error);
+            if (!server) return 1;
+            std::vector<SOCKET> sockets;
+            for (int mode = 0; mode < 4; ++mode) {
+                SOCKET socket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                sockaddr_in address{}; address.sin_family = AF_INET;
+                address.sin_port = htons(29879); address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                if (::connect(socket, reinterpret_cast<sockaddr*>(&address), sizeof(address))) return 1;
+                sockets.push_back(socket);
+                if (mode == 1) {
+                    const char partial[] = "CONNECT example.com:443 HTTP/1.1\r\n";
+                    send(socket, partial, sizeof(partial) - 1, 0);
+                } else if (mode >= 2) {
+                    const unsigned char greeting[]{5, 1, 0};
+                    send(socket, reinterpret_cast<const char*>(greeting), sizeof(greeting), 0);
+                    char reply[2];
+                    if (recv(socket, reply, sizeof(reply), MSG_WAITALL) != 2) return 1;
+                    unsigned char request[]{5, static_cast<unsigned char>(mode == 2 ? 1 : 3),
+                        0, 1, 127, 0, 0, 1, 0, 53};
+                    send(socket, reinterpret_cast<const char*>(request), sizeof(request), 0);
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            auto before = std::chrono::steady_clock::now();
+            server->requestStop();
+            server->requestStop(); // Cancellation is idempotent.
+            tunnel.stop();
+            server.reset();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - before).count();
+            for (SOCKET socket : sockets) closesocket(socket);
+            std::cout << "local_stop_ms=" << elapsed << std::endl;
+            if (elapsed > 500) return 1;
+        }
+        WSACleanup();
+        return 0;
+    }
+
     if ((argc == 4 || argc == 5) && std::wstring_view(argv[1]) == L"--grpc-socks-uri") {
         TunnelConnectResult result;
         auto client = VlessGrpcClient::connect(argv[2], result);
@@ -155,7 +250,10 @@ int wmain(int argc, wchar_t** argv) {
         if (stopTest) {
             std::this_thread::sleep_for(std::chrono::seconds(15));
             auto before = std::chrono::steady_clock::now();
+            server->requestStop();
             client->stop();
+            server.reset();
+            client.reset();
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - before).count();
             std::cout << "vless_stop_ms=" << elapsed << std::endl;

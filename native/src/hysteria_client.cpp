@@ -766,9 +766,9 @@ struct HysteriaClient::Impl {
             }
         }
         if (connection && api) {
-            api->ConnectionShutdown(connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0x100);
-            std::unique_lock lock(mutex);
-            stateChanged.wait_for(lock, 2s, [&] { return shutdownComplete; });
+            // Local disconnect must not wait for a peer on a broken network.
+            // cleanup() closes handles after the external relays have exited.
+            api->ConnectionShutdown(connection, QUIC_CONNECTION_SHUTDOWN_FLAG_SILENT, 0x100);
         }
     }
 

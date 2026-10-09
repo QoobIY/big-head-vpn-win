@@ -59,8 +59,7 @@ bool SchannelTls::connect(const std::wstring& host, unsigned short port, std::ws
         setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
         if (::connect(socket_, address->ai_addr, static_cast<int>(address->ai_addrlen)) == 0) break;
         resolved = WSAGetLastError();
-        closesocket(socket_);
-        socket_ = INVALID_SOCKET;
+        shutdownTransport();
     }
     FreeAddrInfoW(addresses);
     if (socket_ == INVALID_SOCKET) { error = socketError(L"TLS: сервер недоступен", resolved); return false; }
@@ -199,12 +198,14 @@ bool SchannelTls::read(std::vector<unsigned char>& output, std::wstring& error) 
 
 void SchannelTls::close() {
     shutdownTransport();
-    if (socket_ != INVALID_SOCKET) { closesocket(socket_); socket_ = INVALID_SOCKET; }
     if (haveContext_) { DeleteSecurityContext(&context_); haveContext_ = false; }
     if (haveCredentials_) { FreeCredentialsHandle(&credentials_); haveCredentials_ = false; }
     encrypted_.clear();
 }
 
 void SchannelTls::shutdownTransport() {
-    if (socket_ != INVALID_SOCKET) shutdown(socket_, SD_BOTH);
+    // shutdown alone does not cancel a pending blocking WinSock recv.
+    // Keep TLS state alive, but release the socket before joining its reader.
+    SOCKET socket = socket_.exchange(INVALID_SOCKET);
+    if (socket != INVALID_SOCKET) { shutdown(socket, SD_BOTH); closesocket(socket); }
 }

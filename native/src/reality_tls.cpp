@@ -177,7 +177,7 @@ bool parseRealityTlsConfig(const std::wstring& uri, RealityTlsConfig& config,
 }
 
 struct RealityTls::Impl {
-    SOCKET socket{INVALID_SOCKET};
+    std::atomic<SOCKET> socket{INVALID_SOCKET};
     mbedtls_ssl_context ssl{};
     mbedtls_ssl_config sslConfig{};
     mbedtls_entropy_context entropy{};
@@ -344,7 +344,7 @@ struct RealityTls::Impl {
             setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
             setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
             if (::connect(socket, address->ai_addr, static_cast<int>(address->ai_addrlen)) == 0) break;
-            lastError = WSAGetLastError(); closesocket(socket); socket = INVALID_SOCKET;
+            lastError = WSAGetLastError(); abortSocket();
         }
         FreeAddrInfoW(addresses);
         if (socket == INVALID_SOCKET) {
@@ -354,8 +354,13 @@ struct RealityTls::Impl {
         return true;
     }
 
+    void abortSocket() {
+        SOCKET active = socket.exchange(INVALID_SOCKET);
+        if (active != INVALID_SOCKET) { shutdown(active, SD_BOTH); closesocket(active); }
+    }
+
     void close() {
-        if (socket != INVALID_SOCKET) { shutdown(socket, SD_BOTH); closesocket(socket); socket = INVALID_SOCKET; }
+        abortSocket();
         if (initialized) {
             mbedtls_ssl_free(&ssl); mbedtls_ssl_config_free(&sslConfig);
             mbedtls_ctr_drbg_free(&random); mbedtls_entropy_free(&entropy);
@@ -489,8 +494,8 @@ bool RealityTls::readRaw(std::vector<unsigned char>& data, std::wstring& error) 
 }
 
 void RealityTls::shutdownTransport() {
-    if (implementation_ && implementation_->socket != INVALID_SOCKET)
-        shutdown(implementation_->socket, SD_BOTH);
+    // Preserve mbedTLS state until its readers exit, but cancel socket I/O now.
+    if (implementation_) implementation_->abortSocket();
 }
 
 void RealityTls::close() { if (implementation_) implementation_->close(); }

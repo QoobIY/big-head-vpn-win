@@ -519,8 +519,10 @@ void beginDisconnect(std::wstring reconnectProfileId = {}) {
     std::thread([target, reconnectProfileId = std::move(reconnectProfileId),
                     processFilter = std::move(app.processFilter),
                     socks = std::move(app.socks), session = std::move(app.session)]() mutable {
-        // Stop the tunnel first so blocked relay calls wake up, then join the
-        // SOCKS/WinDivert workers while the TunnelClient is still alive.
+        // Interrupt local I/O and packet interception before the tunnel joins
+        // its readers, which may be blocked writing to these local sockets.
+        if (processFilter) processFilter->requestStop();
+        if (socks) socks->requestStop();
         session->stop();
         processFilter.reset();
         socks.reset();
@@ -1150,6 +1152,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_DESTROY:
         KillTimer(hwnd, FILTER_STATUS_TIMER);
         removeTrayIcon();
+        if (app.processFilter) app.processFilter->requestStop();
+        if (app.socks) app.socks->requestStop();
         if (app.session) app.session->stop();
         app.processFilter.reset();
         app.socks.reset();

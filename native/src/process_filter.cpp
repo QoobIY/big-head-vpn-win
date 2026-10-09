@@ -698,7 +698,7 @@ struct ProcessFilter::Impl {
             if (!destinationPort) { ++natMisses; closesocket(socket); continue; }
             char host[INET_ADDRSTRLEN]{}; inet_ntop(AF_INET, &destinationAddress, host, sizeof(host));
             ++accepted; std::string destination = std::string(host) + ":" + std::to_string(destinationPort);
-            std::lock_guard lock(workersMutex); clients.push_back(socket); workers.emplace_back([this, socket, destination = std::move(destination)] { relay(socket, destination); });
+            std::lock_guard lock(workersMutex); if (stopping) { closesocket(socket); break; } clients.push_back(socket); workers.emplace_back([this, socket, destination = std::move(destination)] { relay(socket, destination); });
         }
     }
 
@@ -711,37 +711,52 @@ struct ProcessFilter::Impl {
             if (!state.remotePort) { ++natMisses; closesocket(socket); continue; }
             char host[INET6_ADDRSTRLEN]{}; inet_ntop(AF_INET6, state.remoteAddress.data(), host, sizeof(host));
             ++accepted; std::string destination = "[" + std::string(host) + "]:" + std::to_string(state.remotePort);
-            std::lock_guard lock(workersMutex); clients.push_back(socket); workers.emplace_back([this, socket, destination = std::move(destination)] { relay(socket, destination); });
+            std::lock_guard lock(workersMutex); if (stopping) { closesocket(socket); break; } clients.push_back(socket); workers.emplace_back([this, socket, destination = std::move(destination)] { relay(socket, destination); });
         }
     }
 
     void relay(SOCKET socket, const std::string& destination) {
         std::wstring error; client->relayTcp(destination, static_cast<std::uintptr_t>(socket), error, false);
-        shutdown(socket, SD_BOTH); closesocket(socket);
-        std::lock_guard lock(workersMutex); auto found = std::find(clients.begin(), clients.end(), socket); if (found != clients.end()) clients.erase(found);
+        std::lock_guard lock(workersMutex);
+        auto found = std::find(clients.begin(), clients.end(), socket);
+        if (found != clients.end()) {
+            shutdown(socket, SD_BOTH); closesocket(socket);
+            clients.erase(found);
+        }
+    }
+
+    void requestStop() {
+        if (stopping.exchange(true)) return;
+        udpQueueChanged.notify_all();
+        // Release packet interception before any potentially blocking joins.
+        if (socketHandle != INVALID_HANDLE_VALUE && close) close(socketHandle);
+        if (flowHandle != INVALID_HANDLE_VALUE && close) close(flowHandle);
+        if (networkHandle != INVALID_HANDLE_VALUE && close) close(networkHandle);
+        if (listener != INVALID_SOCKET) { shutdown(listener, SD_BOTH); closesocket(listener); }
+        if (listener6 != INVALID_SOCKET) { shutdown(listener6, SD_BOTH); closesocket(listener6); }
+        std::lock_guard lock(workersMutex);
+        for (SOCKET socket : clients) { shutdown(socket, SD_BOTH); closesocket(socket); }
+        clients.clear();
     }
 
     void stop() {
-        if (stopping.exchange(true)) return;
-        udpQueueChanged.notify_all();
+        requestStop();
         if (client && udpHandlerToken) {
             client->removeUdpReceiveHandler(udpHandlerToken);
             udpHandlerToken = 0;
         }
-        if (socketHandle != INVALID_HANDLE_VALUE && close) { close(socketHandle); socketHandle = INVALID_HANDLE_VALUE; }
-        if (flowHandle != INVALID_HANDLE_VALUE && close) { close(flowHandle); flowHandle = INVALID_HANDLE_VALUE; }
-        if (networkHandle != INVALID_HANDLE_VALUE && close) { close(networkHandle); networkHandle = INVALID_HANDLE_VALUE; }
-        if (listener != INVALID_SOCKET) { closesocket(listener); listener = INVALID_SOCKET; }
-        if (listener6 != INVALID_SOCKET) { closesocket(listener6); listener6 = INVALID_SOCKET; }
         if (socketThread.joinable()) socketThread.join(); if (flowThread.joinable()) flowThread.join(); if (networkThread.joinable()) networkThread.join(); if (acceptThread.joinable()) acceptThread.join(); if (acceptThread6.joinable()) acceptThread6.join(); if (udpSendThread.joinable()) udpSendThread.join();
-        { std::lock_guard lock(workersMutex); for (SOCKET socket : clients) { shutdown(socket, SD_BOTH); closesocket(socket); } clients.clear(); }
         for (auto& worker : workers) if (worker.joinable()) worker.join(); workers.clear();
+        socketHandle = flowHandle = networkHandle = INVALID_HANDLE_VALUE;
+        listener = listener6 = INVALID_SOCKET;
         WSACleanup(); if (module) FreeLibrary(module); module = nullptr;
     }
+
 };
 
 ProcessFilter::ProcessFilter(std::unique_ptr<Impl> implementation) : implementation_(std::move(implementation)) {}
 ProcessFilter::~ProcessFilter() = default;
+void ProcessFilter::requestStop() { implementation_->requestStop(); }
 
 unsigned long long ProcessFilter::matchedFlows() const { return implementation_ ? implementation_->matched.load() : 0; }
 unsigned long long ProcessFilter::redirectedPackets() const { return implementation_ ? implementation_->redirected.load() : 0; }

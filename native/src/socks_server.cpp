@@ -202,6 +202,7 @@ struct SocksServer::Impl {
             if (socket == INVALID_SOCKET) break;
             {
                 std::lock_guard lock(workersMutex);
+                if (stopping) { closesocket(socket); break; }
                 clients.push_back(socket);
                 workers.emplace_back([this, socket] { serve(socket); });
             }
@@ -287,7 +288,10 @@ struct SocksServer::Impl {
         }
         {
             std::lock_guard lock(workersMutex);
-            udpSockets.push_back(association->socket);
+            if (stopping) {
+                closesocket(association->socket);
+                association->socket = INVALID_SOCKET;
+            } else udpSockets.push_back(association->socket);
         }
 
         std::array<unsigned char, 65535> packet{};
@@ -484,29 +488,32 @@ struct SocksServer::Impl {
         }
     }
 
-    void stop() {
+    void requestStop() {
         if (stopping.exchange(true)) return;
+        if (listener != INVALID_SOCKET) { shutdown(listener, SD_BOTH); closesocket(listener); }
+        std::lock_guard lock(workersMutex);
+        for (SOCKET socket : clients) { shutdown(socket, SD_BOTH); closesocket(socket); }
+        clients.clear();
+    }
+
+    void stop() {
+        requestStop();
         if (client && udpHandlerToken) {
             client->removeUdpReceiveHandler(udpHandlerToken);
             udpHandlerToken = 0;
         }
-        if (listener != INVALID_SOCKET) { closesocket(listener); listener = INVALID_SOCKET; }
         if (acceptThread.joinable()) acceptThread.join();
-        {
-            std::lock_guard lock(workersMutex);
-            for (SOCKET socket : clients) { shutdown(socket, SD_BOTH); closesocket(socket); }
-            for (SOCKET socket : udpSockets) closesocket(socket);
-            clients.clear();
-            udpSockets.clear();
-        }
+        listener = INVALID_SOCKET;
         for (auto& worker : workers) if (worker.joinable()) worker.join();
         workers.clear();
         WSACleanup();
     }
+
 };
 
 SocksServer::SocksServer(std::unique_ptr<Impl> implementation) : implementation_(std::move(implementation)) {}
 SocksServer::~SocksServer() = default;
+void SocksServer::requestStop() { implementation_->requestStop(); }
 
 std::unique_ptr<SocksServer> SocksServer::start(const std::wstring& address, unsigned short port, TunnelClient& client, std::wstring& error) {
     auto implementation = std::make_unique<Impl>(); implementation->client = &client;
